@@ -27,6 +27,8 @@ const TEST_PATTERNS = [
   /(^|\/)[^/]+_test\.py$/,               // foo_test.py
   /(^|\/)tests?\/.*\.[cm]?[jt]sx?$/,     // tests/anything.js
   /(^|\/)__tests__\/.*\.[cm]?[jt]sx?$/,  // __tests__/anything.js
+  /(^|\/)test\.[cm]?[jt]sx?$/,           // test.js at the project root
+  /(^|\/)tests\.[cm]?[jt]sx?$/,          // tests.js
   /Tests?\.swift$/,                      // FooTests.swift
   /(^|\/)[^/]+Tests?\.(cs|java|kt)$/,    // FooTest.cs
 ];
@@ -38,7 +40,10 @@ const SOURCE_EXT = new Set([
 ]);
 
 /** Files that are entry points or config, not worth mutating. */
-const SKIP_SOURCE = /(^|\/)(index|main|setup|config|vite\.config|jest\.config|vitest\.config|webpack\.config)\.[cm]?[jt]sx?$/;
+const SKIP_SOURCE = /(^|\/)(main|setup|config|vite\.config|jest\.config|vitest\.config|webpack\.config|rollup\.config|tsup\.config|eslint\.config)\.[cm]?[jt]sx?$/;
+
+/** Type declaration files carry no runtime behaviour to mutate. */
+const SKIP_SOURCE_EXT = /\.d\.[cm]?ts$/;
 
 /** Directories that are entry points rather than library code. */
 const SKIP_SOURCE_DIR = /(^|\/)(bin|scripts|cli|fixtures|__fixtures__)\//;
@@ -78,7 +83,7 @@ async function walk(dir, root, acc, depth = 0) {
 
     const isTest = TEST_PATTERNS.some((re) => re.test(relative(root, full).split('\\').join('/')));
     if (isTest) acc.testFiles.push(full);
-    else if (!SKIP_SOURCE.test(relative(root, full))) {
+    else if (!SKIP_SOURCE.test(relative(root, full)) && !SKIP_SOURCE_EXT.test(entry.name)) {
       const rel = relative(root, full).split('\\').join('/');
       if (SKIP_SOURCE_DIR.test(rel)) continue;
       acc.sourceFiles.push(full);
@@ -164,10 +169,23 @@ async function detectRunner(root) {
     if (deps.vitest) return { command: 'npx --no-install vitest run --reporter=basic', name: 'vitest' };
     if (deps.jest) return { command: 'npx --no-install jest --ci', name: 'jest' };
 
-    // node:test: run the files directly so it works from inside another test.
-    if (deps['tsx'] || deps['ts-node']) {
-      const glob = pkg.scripts?.test ?? '';
-      if (glob.includes('--test')) return { command: 'node --test --test-concurrency=1 "tests/*.test.*"', name: 'node:test' };
+    // Prefer the project's own test script: it knows where the tests live and
+    // which flags they need. Guessing a glob is how you end up running zero tests
+    // and reporting every mutation as a survivor.
+    const script = pkg.scripts?.test;
+    if (script) {
+      const parts = script.split('&&').map((s) => s.trim());
+
+      const cleaned = parts
+        // Drop pure lint/typecheck steps.
+        .filter((s) => !/^(xo|eslint|biome|prettier|tsc|tsd|del-cli)\b/.test(s))
+        // Strip coverage wrappers but keep the command they wrap.
+        .map((s) => s.replace(/^(c8|nyc)\s+/, ''))
+        .filter((s) => /node --test|vitest|jest|mocha|ava|tape/.test(s))
+        .join(' && ')
+        .trim();
+
+      if (cleaned) return { command: cleaned, name: 'package script' };
     }
   }
 

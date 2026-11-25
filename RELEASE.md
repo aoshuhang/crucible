@@ -131,13 +131,71 @@ These are not caveats buried in a README. They are the boundaries of what the to
 
 ---
 
+## Does it work on real code
+
+Run against two mature open-source projects and one sample written the way an
+assistant writes tests:
+
+| project | stars | mutation score | false positives |
+|---|---|---|---|
+| **chalk** | 23k | **92%** | 0 |
+| **slugify** | 2.7k | **100%** | 0 |
+| AI-written sample | — | **25%** | 4 findings |
+
+The two mature projects score high because their tests are good — and `unfake`
+says nothing about them. The AI-written sample is the control: six green tests
+covering a small cart module, and the tool finds four real problems in it.
+
+The score on the sample is the point. Every one of those six tests passes, and
+none of them would notice a bug:
+
+```js
+it('subtotal returns a number', () => {
+  assert.equal(typeof subtotal([{ price: 10, qty: 2 }]), 'number');
+});
+it('shipping works', () => {
+  shipping(30);                    // no assertion at all
+});
+it('total is defined', () => {
+  assert.ok(total([{ price: 10, qty: 1 }]));   // any truthy value passes
+});
+```
+
+`unfake` reports the missing edge at `amount >= FREE_SHIPPING_OVER`, generates the
+test at 49/50/51, and the score moves.
+
+**One honest note on methodology.** The first version of the runner detection
+guessed a test glob. chalk keeps its tests in `test/[!_]*.js`, the guessed glob
+matched nothing, zero tests ran, the suite was always green, and every mutation was
+reported as a survivor — a confident `0%` about a project that actually catches the
+mutation. It was caught by manually breaking `index.js` and watching 30 tests fail
+while `unfake` still said "survived". The runner now comes from the project's own
+test script, and there are five regression tests pinning that. A wrong score is
+worse than no score.
+
+---
+
+## Limits, stated plainly
+
+**Object arguments are reported, not fixed.** `decideState(perception)` takes a shape, not a number. Feeding it `9, 10, 11` throws. `unfake` prints the exact comparison and the case you need to write, and says so instead of generating a broken test. On a real project this was 5 of 9 files.
+
+**Equivalent mutants exist.** Bumping a config constant that no test should pin produces a survivor that is not a defect. The tool filters loop counters, bitwise tricks and shifts, but equivalence cannot be proven in general.
+
+**Runs are sequential.** Mutations rewrite source, so files cannot be processed in parallel. Large repos are slow; use `--limit`.
+
+**JS/TS is the best-covered path.** The Python, Go, Rust and Swift runners are detected and mutated, but the boundary-fixing logic has only been exercised on JS/TS projects so far.
+
+**No discoverable test script means refusal, not a guess.** If the runner cannot be determined from `package.json` or a known config, `unfake` says so and stops. Guessing produced a confidently wrong `0%` score once, which is exactly the failure mode this tool exists to prevent.
+
+---
+
 ## Status
 
-Version 0.1.0. 2,207 lines, 29 tests, zero false positives when scanning itself.
+Version 0.1.0. 2,239 lines, 34 tests. Zero false positives scanning itself, chalk and slugify.
 
-The self-scan is the honest benchmark: `unfake` run against its own test suite reports `0 tests cannot fail, 0 untested edges, 0 do not check values`. A tool that flags its own healthy tests would not be worth shipping.
+The self-scan is the honest benchmark: `unfake` run against its own suite reports `0 tests cannot fail, 0 untested edges, 0 do not check values`.
 
-Not yet published publicly. The mechanism works and the numbers are real; what it needs before a public launch is a head-to-head on a few well-known open-source repos, so the first impression is evidence rather than a claim.
+Repository is private for now. The mechanism works and the numbers above are reproducible. The main open gap is object-argument boundaries: reported with a concrete suggestion, not auto-fixed.
 
 ---
 

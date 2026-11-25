@@ -37,6 +37,17 @@ const PATTERNS = [
     fix: 'assert the concrete value or shape',
   },
   {
+    id: 'type-only',
+    kind: 'weak',
+    needsStrings: true,
+    // expect(typeof x).toBe('number') / assert.equal(typeof x, 'string')
+    // Asserts the type, never the value. Passes for every wrong number.
+    // The subject may be a call, so parentheses inside it must be allowed.
+    re: /(?:expect\s*\(\s*typeof\s+.+?\)\s*\.\s*(?:toBe|toEqual)\s*\(\s*['"][^'"]+['"]\s*\)|assert\.\w+\s*\(\s*typeof\s+.+?,\s*['"][^'"]+['"]\s*\))/,
+    why: 'checks only the type, so any value of that type passes, including a wrong one',
+    fix: 'assert the exact value',
+  },
+  {
     id: 'truthy-only',
     kind: 'weak',
     re: /expect\s*\(\s*[^)]+\)\s*\.\s*toBeTruthy\s*\(\s*\)/,
@@ -205,7 +216,8 @@ export function scanTestSource(source, fileLabel, options = {}) {
   const maskedLines = maskedSource.split('\n');
 
   // Line-level pattern hits, matched against the masked text so sample code inside
-  // string literals is ignored.
+  // string literals is ignored. Type-only assertions need the real text, because
+  // the type name lives inside a string literal.
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
     const masked = maskedLines[i] ?? '';
@@ -213,7 +225,8 @@ export function scanTestSource(source, fileLabel, options = {}) {
 
     for (const p of PATTERNS) {
       if (!p.re) continue;
-      if (!p.re.test(masked)) continue;
+      const haystack = p.needsStrings ? line : masked;
+      if (!p.re.test(haystack)) continue;
       findings.push({
         id: p.id,
         file: fileLabel,

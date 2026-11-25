@@ -363,7 +363,8 @@ export function placement({ sourceFile, testFiles, root }) {
   const suffix = isTs ? '.test.ts' : '.test.js';
   const probeExt = isTs ? '.test.ts' : '.test.js';
 
-  const near = testFiles.find((t) => t.includes('/tests/') || t.includes('/__tests__/'));
+  // Prefer the directory the project already keeps its tests in.
+  const near = testFiles.find((t) => /\/(tests?|__tests__)\//.test(t));
   const dir = near ? dirname(near) : dirname(sourceFile);
   const base = basename(sourceFile).replace(/\.[^.]+$/, '');
   const fixPath = join(dir, `${base}.exact${suffix}`);

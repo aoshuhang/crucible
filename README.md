@@ -151,6 +151,21 @@ a `finally` block. Two guarantees:
 
 Run it on a clean working tree anyway — that is what git is for.
 
+## Does it work on real code
+
+| project | stars | mutation score | false positives |
+|---|---|---|---|
+| **chalk** | 23k | **92%** | 0 |
+| **slugify** | 2.7k | **100%** | 0 |
+| AI-written sample | — | **25%** | 4 findings |
+
+Mature projects score high and `unfake` says nothing about them. The AI-written
+sample is the control: six green tests over a small cart module, four real problems
+found, none of which would catch a bug.
+
+Full methodology, including the runner-detection bug that produced a confidently
+wrong `0%` before it was caught, is in [RELEASE.md](RELEASE.md).
+
 ## Limits, stated plainly
 
 - **Boundaries on object arguments are reported, not fixed.** `decideState(perception)`
@@ -161,6 +176,8 @@ Run it on a clean working tree anyway — that is what git is for.
   and shifts, but it cannot prove equivalence in general.
 - **One file at a time.** Mutations rewrite source, so runs are sequential. A large
   repo is slow; use `--limit` to audit the files you care about.
+- **No discoverable test script means refusal, not a guess.** A wrong score is worse
+  than no score.
 
 ## License
 
