@@ -1,0 +1,274 @@
+/**
+ * Project discovery: find source files, test files, and which tests cover which
+ * source.
+ *
+ * This distinction is the difference between an honest report and a useless one:
+ *   - a source file with no test importing it is UNTESTED
+ *   - a source file whose tests pass after we break it has a FAKE test
+ * Only the second one is the product. Reporting "untested" as "fake test" would
+ * destroy credibility on the first real project anyone runs it against.
+ */
+
+import { readdir, readFile, stat } from 'node:fs/promises';
+import { join, relative, resolve, dirname, basename, extname } from 'node:path';
+
+/** Directories that never contain product source worth auditing. */
+const SKIP_DIRS = new Set([
+  'node_modules', '.git', 'dist', 'build', 'out', 'coverage', 'vendor',
+  '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache', 'target', '__pycache__',
+  '.venv', 'venv', '.tox', '.mypy_cache', '.pytest_cache', 'Pods', 'DerivedData',
+  '.build', 'tmp', 'temp', '.idea', '.vscode', 'fixtures', '__fixtures__',
+]);
+
+/** Test-file naming conventions across ecosystems. */
+const TEST_PATTERNS = [
+  /\.(test|spec)\.[cm]?[jt]sx?$/,        // foo.test.ts, foo.spec.jsx
+  /(^|\/)test_[^/]+\.py$/,               // test_foo.py
+  /(^|\/)[^/]+_test\.py$/,               // foo_test.py
+  /(^|\/)tests?\/.*\.[cm]?[jt]sx?$/,     // tests/anything.js
+  /(^|\/)__tests__\/.*\.[cm]?[jt]sx?$/,  // __tests__/anything.js
+  /Tests?\.swift$/,                      // FooTests.swift
+  /(^|\/)[^/]+Tests?\.(cs|java|kt)$/,    // FooTest.cs
+];
+
+/** Source extensions we can mutate. */
+const SOURCE_EXT = new Set([
+  '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx',
+  '.py', '.go', '.rs', '.swift', '.java', '.kt', '.cs',
+]);
+
+/** Files that are entry points or config, not worth mutating. */
+const SKIP_SOURCE = /(^|\/)(index|main|setup|config|vite\.config|jest\.config|vitest\.config|webpack\.config)\.[cm]?[jt]sx?$/;
+
+/** Directories that are entry points rather than library code. */
+const SKIP_SOURCE_DIR = /(^|\/)(bin|scripts|cli|fixtures|__fixtures__)\//;
+
+/**
+ * @typedef {object} Project
+ * @property {string} root
+ * @property {string[]} sourceFiles    absolute paths
+ * @property {string[]} testFiles      absolute paths
+ * @property {Map<string,string[]>} covers  source path -> test paths that reference it
+ * @property {{ command: string, name: string } | null} runner
+ */
+
+async function walk(dir, root, acc, depth = 0) {
+  if (depth > 12) return;
+
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      if (entry.name.startsWith('.') && entry.name !== '.') continue;
+      await walk(full, root, acc, depth + 1);
+      continue;
+    }
+
+    if (!entry.isFile()) continue;
+    const ext = extname(entry.name);
+    if (!SOURCE_EXT.has(ext)) continue;
+
+    const isTest = TEST_PATTERNS.some((re) => re.test(relative(root, full).split('\\').join('/')));
+    if (isTest) acc.testFiles.push(full);
+    else if (!SKIP_SOURCE.test(relative(root, full))) {
+      const rel = relative(root, full).split('\\').join('/');
+      if (SKIP_SOURCE_DIR.test(rel)) continue;
+      acc.sourceFiles.push(full);
+    }
+  }
+}
+
+/**
+ * Read a test file and extract every import/require path plus bare identifiers.
+ * We resolve them relative to the test file and match against known sources.
+ */
+function referencedSpecifiers(text) {
+  const specs = new Set();
+
+  const patterns = [
+    /\bfrom\s+['"]([^'"]+)['"]/g,            // ES import ... from 'x'
+    /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g, // dynamic import('x')
+    /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g, // require('x')
+    /^\s*import\s+['"]([^'"]+)['"]/gm,        // side-effect import 'x'
+    /\b(?:from|import)\s+([\w.]+)\s+import/g, // python: from x import
+  ];
+
+  for (const re of patterns) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) specs.add(m[1]);
+  }
+
+  return [...specs];
+}
+
+/**
+ * Normalise a module specifier to a comparable form: strip extension, strip
+ * trailing /index, drop a leading './'.
+ */
+function normaliseSpec(spec) {
+  let s = spec.replace(/\\/g, '/');
+  s = s.replace(/^\.\//, '');
+  s = s.replace(/\.[cm]?[jt]sx?$/, '');
+  s = s.replace(/\.py$/, '');
+  s = s.replace(/\/index$/, '');
+  return s;
+}
+
+/** The comparable key for a real file path. */
+function normalisePath(root, file) {
+  let rel = relative(root, file).replace(/\\/g, '/');
+  rel = rel.replace(/\.[cm]?[jt]sx?$/, '');
+  rel = rel.replace(/\.py$/, '');
+  rel = rel.replace(/\/index$/, '');
+  return rel;
+}
+
+/**
+ * Decide how to run this project's tests.
+ *
+ * `npm run test` is avoided on purpose: when unfake runs inside a test process,
+ * node:test refuses to nest and silently skips the suite, which would make every
+ * mutation look like it survived. We call the runner binary directly instead.
+ */
+async function detectRunner(root) {
+  const has = async (name) => {
+    try {
+      await stat(join(root, name));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  let pkg = null;
+  if (await has('package.json')) {
+    try {
+      pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+    } catch {
+      pkg = null;
+    }
+  }
+
+  if (pkg) {
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+
+    if (deps.vitest) return { command: 'npx --no-install vitest run --reporter=basic', name: 'vitest' };
+    if (deps.jest) return { command: 'npx --no-install jest --ci', name: 'jest' };
+
+    // node:test: run the files directly so it works from inside another test.
+    if (deps['tsx'] || deps['ts-node']) {
+      const glob = pkg.scripts?.test ?? '';
+      if (glob.includes('--test')) return { command: 'node --test --test-concurrency=1 "tests/*.test.*"', name: 'node:test' };
+    }
+  }
+
+  for (const [file, command, name] of [
+    ['pytest.ini', 'python3 -m pytest -x -q', 'pytest'],
+    ['pyproject.toml', 'python3 -m pytest -x -q', 'pytest'],
+    ['tox.ini', 'python3 -m pytest -x -q', 'pytest'],
+    ['go.mod', 'go test ./...', 'go test'],
+    ['Cargo.toml', 'cargo test --quiet', 'cargo test'],
+    ['Package.swift', 'swift test', 'swift test'],
+  ]) {
+    if (await has(file)) return { command, name };
+  }
+
+  // Last resort: read the test script and rewrite `npm run test` into a direct
+  // invocation so it survives being called from inside a test process.
+  if (pkg?.scripts?.test) {
+    const script = pkg.scripts.test;
+    if (script.includes('node --test')) {
+      const direct = script.replace(/^npm run \w+\s*(--\s*)?/, '').trim();
+      if (direct.startsWith('node --test')) {
+        return { command: direct, name: 'node:test' };
+      }
+    }
+  }
+
+  if (await has('package.json')) {
+    return { command: 'node --test --test-concurrency=1 "tests/*.test.js"', name: 'node:test' };
+  }
+
+  return null;
+}
+
+/**
+ * @param {string} root
+ * @returns {Promise<Project>}
+ */
+export async function discover(root) {
+  const abs = resolve(root);
+  const acc = { sourceFiles: [], testFiles: [] };
+  await walk(abs, abs, acc);
+
+  /** @type {Map<string,string[]>} */
+  const covers = new Map();
+  for (const src of acc.sourceFiles) covers.set(src, []);
+
+  // Build a lookup from normalised source key to absolute source path.
+  const byKey = new Map();
+  for (const src of acc.sourceFiles) byKey.set(normalisePath(abs, src), src);
+
+  for (const testFile of acc.testFiles) {
+    let text;
+    try {
+      text = await readFile(testFile, 'utf8');
+    } catch {
+      continue;
+    }
+
+    const specs = referencedSpecifiers(text);
+    const seen = new Set();
+
+    for (const spec of specs) {
+      if (spec.startsWith('node:') || spec.startsWith('http')) continue;
+
+      // Relative specifier: resolve against the test file's directory.
+      let key = null;
+      if (spec.startsWith('.')) {
+        const resolved = resolve(dirname(testFile), spec);
+        key = normalisePath(abs, resolved);
+      } else if (!spec.startsWith('@') && spec.includes('/')) {
+        // Python-style dotted module or a bare path; try as a project-relative path.
+        key = normaliseSpec(spec);
+      } else {
+        key = normaliseSpec(spec);
+      }
+
+      const target = byKey.get(key);
+      if (target && !seen.has(target)) {
+        seen.add(target);
+        covers.get(target).push(testFile);
+      }
+    }
+
+    // Fallback: a test that mentions the source basename is likely covering it.
+    for (const src of acc.sourceFiles) {
+      if (seen.has(src)) continue;
+      const base = basename(src).replace(/\.[^.]+$/, '');
+      if (base.length < 4) continue;
+      const re = new RegExp(`\\b${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+      if (re.test(text)) {
+        seen.add(src);
+        covers.get(src).push(testFile);
+      }
+    }
+  }
+
+  return {
+    root: abs,
+    sourceFiles: acc.sourceFiles.sort(),
+    testFiles: acc.testFiles.sort(),
+    covers,
+    runner: await detectRunner(abs),
+  };
+}
