@@ -45,6 +45,13 @@ const noMutation = flags.has('--no-mutation');
 const limitArg = argv.find((a) => a.startsWith('--limit='));
 const maxFiles = limitArg ? Number(limitArg.split('=')[1]) : 12;
 
+const profileArg = argv.find((a) => a.startsWith('--profile='));
+const profile = profileArg ? profileArg.split('=')[1] : 'logic';
+if (!['logic', 'strict'].includes(profile)) {
+  console.error(`unknown profile: ${profile} (expected logic or strict)`);
+  process.exit(1);
+}
+
 const say = (...parts) => { if (!asJson) console.log(...parts); };
 
 /** The neighbouring operator, for readable report text. */
@@ -83,6 +90,8 @@ async function mutationPass(project, { onProgress } = {}) {
       root: project.root,
       file: sourceFile,
       command: project.runner.command,
+      profile,
+      testFiles,
       onProgress,
     });
 
@@ -403,7 +412,8 @@ options:
   --json           machine-readable output
   --verbose        show each mutation as it runs
   --no-mutation    static checks only (fast, no test runs)
-  --limit=N        audit at most N source files (default 12)`);
+  --limit=N        audit at most N source files (default 12)
+  --profile=NAME   logic (default, skips tuning constants) or strict`);
   process.exit(1);
 }
 

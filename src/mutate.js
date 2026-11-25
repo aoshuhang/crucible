@@ -25,6 +25,9 @@ const OPERATORS = [
   { kind: 'comparison', from: '<=', to: '<', label: 'flip <= to <' },
   { kind: 'comparison', from: '==', to: '!=', label: 'flip == to !=' },
   { kind: 'comparison', from: '!=', to: '==', label: 'flip != to ==' },
+  // Bare > and < last, so >= and <= win at their positions.
+  { kind: 'comparison', from: '>', to: '>=', label: 'flip > to >=' },
+  { kind: 'comparison', from: '<', to: '<=', label: 'flip < to <=' },
   { kind: 'boolean', from: '&&', to: '||', label: 'flip && to ||' },
   { kind: 'boolean', from: '||', to: '&&', label: 'flip || to &&' },
   { kind: 'arithmetic', from: '+', to: '-', label: 'flip + to -' },
@@ -37,6 +40,23 @@ const NUMBER_LITERALS = /\b(\d+(?:\.\d+)?)\b/g;
 
 /** Lines that are noise for mutation purposes. */
 const SKIP_LINE = /^\s*(\/\/|\/\*|\*|#|import\s|from\s|require\(|'use strict'|"use strict")/;
+
+/**
+ * A line that only assigns a literal: `let maxHealth = 34;`
+ *
+ * These are the tuning constants of a program — health, speed, damage, tax rates.
+ * Bumping one usually produces an equivalent mutant from the test suite's point of
+ * view, because pinning every magic number would turn tests into a maintenance
+ * burden that fails on every balance change.
+ *
+ * The match must be strict: the right-hand side has to be a single literal, not an
+ * expression. `const visible = a > b` is logic and must still be mutated.
+ *
+ * Under the `logic` profile we skip these; under `strict` we mutate them.
+ */
+const DECLARATION_ONLY = /^\s*(?:let|const|var)\s+[\w$]+\s*(?::\s*[^=]+)?=\s*(?:-?\d+(?:\.\d+)?|true|false|null|undefined)\s*;?\s*$/;
+
+/** A string literal in a return or assignment: `return 'full';` */
 
 /**
  * Strip string literals and comments so we never mutate prose.
@@ -144,11 +164,19 @@ function findOperators(masked) {
 
 /**
  * Yield candidate mutations for one file's source text.
+ *
  * @param {string} source
- * @param {string} fileLabel
+ * @param {string} [fileLabel]
+ * @param {{ profile?: 'logic'|'strict' }} [options]
+ *   logic  (default) skips declaration-only lines: tuning constants are not a test
+ *          quality signal.
+ *   strict mutates everything, including constants.
  * @returns {Mutation[]}
  */
-export function mutationsFor(source, fileLabel = 'source') {
+export function mutationsFor(source, fileLabel = 'source', options = {}) {
+  const profile = options.profile ?? 'logic';
+  const strict = profile === 'strict';
+
   const lines = source.split('\n');
   /** @type {Mutation[]} */
   const out = [];
@@ -175,19 +203,33 @@ export function mutationsFor(source, fileLabel = 'source') {
       });
     };
 
+    const declarationOnly = DECLARATION_ONLY.test(raw);
+
     // 1. Operators (comparisons, booleans, arithmetic).
+    //    Arithmetic inside a declaration is a formula, not a constant, so it is
+    //    still worth mutating under the logic profile.
     for (const { start, end, op } of findOperators(masked)) {
+      if (declarationOnly && !strict && op.kind === 'arithmetic') {
+        // `let speed = 5.6 + 0.4 * (size - 1)` — this is a formula. Mutating it
+        // is legitimate: it changes behaviour, not tuning.
+        push(op.kind, start, end, op.to, op.label);
+        continue;
+      }
+      if (declarationOnly && !strict && op.kind === 'boolean') continue;
       push(op.kind, start, end, op.to, op.label);
     }
 
-    // 2. Numeric literals: 0 -> 1, n -> n+1. Catches "returns the right number" claims.
-    NUMBER_LITERALS.lastIndex = 0;
-    let numMatch;
-    while ((numMatch = NUMBER_LITERALS.exec(masked)) !== null) {
-      const value = Number(numMatch[1]);
-      const bumped = value === 0 ? '1' : String(value + 1);
-      push('number', numMatch.index, numMatch.index + numMatch[1].length, bumped,
-        `bump ${numMatch[1]} to ${bumped}`);
+    // 2. Numeric literals. Under the logic profile a bare constant declaration is
+    //    skipped, because pinning every tuning number is not a quality signal.
+    if (!(declarationOnly && !strict)) {
+      NUMBER_LITERALS.lastIndex = 0;
+      let numMatch;
+      while ((numMatch = NUMBER_LITERALS.exec(masked)) !== null) {
+        const value = Number(numMatch[1]);
+        const bumped = value === 0 ? '1' : String(value + 1);
+        push('number', numMatch.index, numMatch.index + numMatch[1].length, bumped,
+          `bump ${numMatch[1]} to ${bumped}`);
+      }
     }
 
     // 3. Literal boolean returns.
@@ -196,6 +238,58 @@ export function mutationsFor(source, fileLabel = 'source') {
       const start = retMatch.index + retMatch[0].length - retMatch[1].length;
       push('return', start, start + retMatch[1].length,
         retMatch[1] === 'true' ? 'false' : 'true', `flip return ${retMatch[1]}`);
+    }
+
+    // 4. Condition negation: `if (x)` -> `if (!x)`.
+    //    Catches branches that are never exercised in both directions.
+    const condMatch = masked.match(/\b(if|while)\s*\(\s*(?![!(])/);
+    if (condMatch) {
+      const open = condMatch.index + condMatch[0].length;
+      // Find the matching close paren to wrap the whole condition.
+      let depth = 1;
+      let close = -1;
+      for (let i = open; i < masked.length; i += 1) {
+        if (masked[i] === '(') depth += 1;
+        else if (masked[i] === ')') {
+          depth -= 1;
+          if (depth === 0) { close = i; break; }
+        }
+      }
+      if (close !== -1) {
+        push('condition', open, close, `!(${raw.slice(open, close)})`,
+          'negate the condition');
+      }
+    }
+
+    // 5. Statement removal: a bare `return expr;` becomes `return undefined;`.
+    //    Catches return values nobody checks.
+    const bareReturn = masked.match(/\breturn\s+([^;]+);/);
+    if (bareReturn && !/\breturn\s+(true|false)\b/.test(masked)) {
+      const start = bareReturn.index + bareReturn[0].indexOf('return') + 'return'.length;
+      const end = bareReturn.index + bareReturn[0].length - 1;
+      push('statement', start, end, ' undefined', 'drop the returned value');
+    }
+
+    // 6. String literals in returns or comparisons: `'full'` -> `''`.
+    //    Catches status strings that no test asserts.
+    //    A fresh regex per line: the shared one carries lastIndex between calls.
+    const strings = /(['"])((?:\\.|(?!\1).)*)\1/g;
+    let strMatch;
+    while ((strMatch = strings.exec(raw)) !== null) {
+      const content = strMatch[2];
+      if (content.length === 0) continue;
+      if (content.length > 40) continue;
+      // Skip module specifiers and obvious paths.
+      if (/^[./]/.test(content) || content.includes('/')) continue;
+      // Only mutate when the string is used as a value, not as an object key.
+      // An object key looks like `{ 'a': 1 }` or `, 'b': 2` — the colon comes
+      // right after the string and the string follows a brace or comma.
+      const after = raw.slice(strMatch.index + strMatch[0].length);
+      const before = raw.slice(0, strMatch.index).trimEnd();
+      const isObjectKey = /^\s*:/.test(after) && /[{,]$/.test(before);
+      if (isObjectKey) continue;
+      push('string', strMatch.index, strMatch.index + strMatch[0].length, '""',
+        `empty the string ${JSON.stringify(content)}`);
     }
   }
 
@@ -220,4 +314,7 @@ export const operators = {
   arithmetic: 'flips + with -',
   number: 'bumps numeric literals by one',
   return: 'flips a literal true/false return',
+  condition: 'negates an if/while condition',
+  statement: 'drops a returned value',
+  string: 'empties a string literal',
 };

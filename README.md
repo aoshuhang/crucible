@@ -124,6 +124,7 @@ unfake verify [dir]     re-run the audit after a fix
 | `--verbose` | print each mutation as it runs |
 | `--no-mutation` | static checks only, no test runs |
 | `--limit=N` | audit at most N source files (default 12) |
+| `--profile=logic\|strict` | skip tuning constants (default) or mutate everything |
 
 ## Supported runners
 
@@ -155,10 +156,11 @@ Run it on a clean working tree anyway — that is what git is for.
 
 | project | stars | mutation score | false positives |
 |---|---|---|---|
-| **chalk** | 23k | **92%** | 0 |
+| **chalk** | 23k | **100%** | 0 |
 | **slugify** | 2.7k | **100%** | 0 |
-| AI-written sample | — | **25%** | 4 findings |
-| object-field sample | — | 0% → **67%** after fix | — |
+| AI-written sample | — | **58%** | 4 findings |
+| object-field sample | — | 0% → **67%** after fix |
+| 5k-line game prototype | — | **52%** | 17 edges |
 
 Mature projects score high and `unfake` says nothing about them. The AI-written
 sample is the control: six green tests over a small cart module, four real problems
@@ -166,6 +168,45 @@ found, none of which would catch a bug.
 
 Full methodology, including the runner-detection bug that produced a confidently
 wrong `0%` before it was caught, is in [RELEASE.md](RELEASE.md).
+
+## Two profiles
+
+A tuning constant is not a test-quality signal. `let maxHealth = 34` should not
+require a test that fails when you rebalance the game.
+
+```
+unfake scan --profile=logic    # default: skip bare constant declarations
+unfake scan --profile=strict   # mutate everything, including constants
+```
+
+`logic` still mutates formulas (`let speed = 5.6 + 0.4 * (size - 1)`) and
+comparisons inside declarations, because those change behaviour. It only skips
+lines whose right-hand side is a single literal.
+
+## Operators
+
+| kind | example | catches |
+|---|---|---|
+| comparison | `>=` → `>` | off-by-one at a threshold |
+| condition | `if (x)` → `if (!x)` | a branch never taken both ways |
+| boolean | `&&` → `\|\|` | wrong logical connective |
+| statement | `return x` → `return undefined` | a return value nobody checks |
+| return | `return true` → `return false` | inverted result |
+| string | `'full'` → `''` | a status string no test asserts |
+| arithmetic | `+` → `-` | wrong operator in a formula |
+| number | `34` → `35` | an unpinned computed value |
+
+## Speed
+
+Mutations rewrite source, so files run sequentially. Two things keep it usable:
+
+- **Only covering tests run.** If a source file has 2 covering test files, the
+  command is narrowed to those instead of the whole suite.
+- **Sampling covers the whole file.** 12 mutations are chosen by line bucket, not
+  by taking the first 12 matches, so a well-tested first half cannot hide a bare
+  second half.
+
+A 9-file audit of a 5k-line TypeScript game prototype takes 70 seconds.
 
 ## What it cannot fix, and says so
 

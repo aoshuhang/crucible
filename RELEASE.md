@@ -181,7 +181,7 @@ worse than no score.
 
 **Equivalent mutants exist.** Bumping a config constant that no test should pin produces a survivor that is not a defect. The tool filters loop counters, bitwise tricks and shifts, but equivalence cannot be proven in general.
 
-**Runs are sequential.** Mutations rewrite source, so files cannot be processed in parallel. A 9-file audit of the game prototype took 80 seconds; large repos need `--limit`.
+**Runs are sequential.** Mutations rewrite source, so files cannot be processed in parallel. A 9-file audit of the game prototype took 70 seconds; large repos need `--limit`.
 
 **Xcode projects are detected but impractically slow.** A single `xcodebuild test` cycle measured 5m37s on a real project, making a 12-mutation audit take over an hour. Technically supported, practically not.
 
@@ -193,7 +193,7 @@ worse than no score.
 
 ## Status
 
-Version 0.1.0. 2,797 lines, 45 tests. Zero false positives scanning itself, chalk and slugify.
+Version 0.1.0. 2,991 lines, 64 tests. Zero false positives scanning itself, chalk and slugify.
 
 The self-scan is the honest benchmark: `unfake` run against its own suite reports `0 tests cannot fail, 0 untested edges, 0 do not check values`.
 
@@ -203,14 +203,28 @@ Repository is private for now. The mechanism works and the numbers above are rep
 
 | project | stars | score | notes |
 |---|---|---|---|
-| chalk | 23k | 92% | 0 false positives |
+| chalk | 23k | 100% | 0 false positives |
 | slugify | 2.7k | 100% | 0 false positives |
-| AI-written cart module | — | 25% | 4 findings, all real |
+| AI-written cart module | — | 58% | 4 findings, all real |
 | object-field sample | — | 0% → 67% | auto-fixed |
-| 5k-line game prototype | — | 38% | 5 edges reported, 0 auto-fixable |
+| 5k-line game prototype | — | 52% | 17 edges reported |
 
 ---
 
 ## License
 
 MIT
+
+---
+
+## What changed after validation
+
+Three upgrades, each driven by a measurement rather than a guess:
+
+**Two profiles.** A bare tuning constant (`let maxHealth = 34`) is not a test-quality signal. Under the default `logic` profile those lines are skipped; formulas and comparisons inside declarations are still mutated, because they change behaviour. `--profile=strict` mutates everything. On the game prototype this moved a file from 25% to 58% — the earlier number was mostly counting rebalanced constants as defects.
+
+**Five more operators.** Condition negation (`if (x)` → `if (!x)`), statement removal (`return x` → `return undefined`), and string emptying (`'full'` → `''`) alongside the existing comparison/boolean/arithmetic/number/return set. Each one targets a failure the earlier set could not see: a branch never taken both ways, a return value nobody checks, a status string no test asserts.
+
+**Even sampling and narrowed commands.** 12 mutations are chosen by line bucket so a well-tested first half cannot hide a bare second half, and only the test files covering the source are run instead of the whole suite.
+
+**One bug found by the upgrade itself.** The operator table had `>=`, `<=`, `==`, `===` but not bare `>` and `<`. Every `a > b` in every project had been silently unmutable since the first commit — the most common comparison in the language. Caught by a test asserting that a comparison inside a declaration is still mutated, which returned zero mutations. All scores before that fix were understated for files dominated by `>` and `<`.
