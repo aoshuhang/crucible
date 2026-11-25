@@ -24,6 +24,8 @@ import { rankSurvivors, isBoundaryMutation } from '../src/boundary.js';
 import { exportedNames, harvestCallSites, buildProbe, parseProbeOutput,
   buildFixTest, placement } from '../src/fix.js';
 import { fixBoundaries } from '../src/fix-boundary.js';
+import { fixObjectBoundary } from '../src/fix-object.js';
+import { mapComparisonsToFunctions } from '../src/fix-boundary.js';
 
 const C = {
   reset: '\u001b[0m', dim: '\u001b[2m', bold: '\u001b[1m',
@@ -284,6 +286,33 @@ async function cmdFix() {
 
     if (boundary.manual?.length) {
       say(`  ${C.cyan}manual${C.reset} ${rel} ${C.dim}(${boundary.reason})${C.reset}`);
+
+      // Try the object-argument path for each manual case: some of them are
+      // fixable by reusing the argument shape the project's tests already build.
+      const sourceText = await readFile(sourceFile, 'utf8');
+      const mapped = mapComparisonsToFunctions(sourceText);
+      let objectFixed = 0;
+
+      for (const { fn, comparison } of mapped) {
+        const result = await fixObjectBoundary({
+          root: project.root,
+          sourceFile,
+          testFiles,
+          fn,
+          comparison,
+          source: sourceText,
+          runner: probeStyle,
+        });
+
+        if (result.written) {
+          objectFixed += 1;
+          written.push({ fixPath: result.written, kind: 'object-boundary' });
+          say(`  ${C.green}wrote${C.reset} ${result.written.replace(project.root + '/', '')}`
+            + ` ${C.dim}(${fn}: ${comparison.left} ${comparison.op} ${comparison.right})${C.reset}`);
+        }
+      }
+
+      if (objectFixed > 0) continue;
     }
 
     // 2. Otherwise pin exact values for the calls the tests already make.

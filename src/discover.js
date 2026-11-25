@@ -200,6 +200,25 @@ async function detectRunner(root) {
     if (await has(file)) return { command, name };
   }
 
+  // Xcode projects: find the scheme and the test target so the command is concrete.
+  // `xcodebuild test` is slow (it rebuilds), so callers must keep --limit small.
+  try {
+    const entries = await readdir(root);
+    const proj = entries.find((e) => e.endsWith('.xcodeproj'));
+    const ws = entries.find((e) => e.endsWith('.xcworkspace'));
+
+    if (proj || ws) {
+      const container = ws ? `-workspace ${JSON.stringify(ws)}` : `-project ${JSON.stringify(proj)}`;
+      // The scheme usually matches the project name without the extension.
+      const scheme = (proj ?? ws).replace(/\.(xcodeproj|xcworkspace)$/, '');
+      return {
+        command: `xcodebuild test ${container} -scheme ${JSON.stringify(scheme)} -destination 'platform=macOS' -quiet`,
+        name: 'xcodebuild',
+        slow: true,
+      };
+    }
+  } catch { /* ignore */ }
+
   // Last resort: read the test script and rewrite `npm run test` into a direct
   // invocation so it survives being called from inside a test process.
   if (pkg?.scripts?.test) {

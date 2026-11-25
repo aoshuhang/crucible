@@ -158,6 +158,7 @@ Run it on a clean working tree anyway — that is what git is for.
 | **chalk** | 23k | **92%** | 0 |
 | **slugify** | 2.7k | **100%** | 0 |
 | AI-written sample | — | **25%** | 4 findings |
+| object-field sample | — | 0% → **67%** after fix | — |
 
 Mature projects score high and `unfake` says nothing about them. The AI-written
 sample is the control: six green tests over a small cart module, four real problems
@@ -166,16 +167,41 @@ found, none of which would catch a bug.
 Full methodology, including the runner-detection bug that produced a confidently
 wrong `0%` before it was caught, is in [RELEASE.md](RELEASE.md).
 
+## What it cannot fix, and says so
+
+A boundary comparison is only auto-fixed when a probe can **observe** it.
+
+```js
+// Fixed: the comparison IS the return value.
+export function canEnter(actor) { return actor.level >= 5; }
+
+// Not fixed: the comparison feeds an intermediate variable that several branches
+// consume. Probing 14/15/16 all return 'wander', because the real difference only
+// appears when other conditions also hold.
+const visible = threat.distance <= p.sightRange;
+if (visible && p.healthFrac < 0.3) return 'flee';
+```
+
+In the second case `unfake` refuses to write the test. Writing it would pin three
+identical values — a green test that cannot fail, which is the exact defect this
+tool exists to find. It prints the comparison and the case a human needs instead.
+
+On a real project (a 5k-line game prototype) this split was 0 of 9 files fixable:
+every boundary was an intermediate variable in a state machine. That is an honest
+result, not a failure — the report still names all 5 untested edges with the exact
+expression.
+
 ## Limits, stated plainly
 
-- **Boundaries on object arguments are reported, not fixed.** `decideState(perception)`
-  needs an object; feeding it `9, 10, 11` throws. unfake prints the exact comparison
-  and the case you need, and says it needs a hand-written test.
+- **Boundaries on intermediate variables are reported, not fixed.** See above.
 - **Equivalent mutants exist.** Bumping a config constant that no test should pin
   produces a survivor that is not a defect. The tool filters loops, bitwise tricks
   and shifts, but it cannot prove equivalence in general.
 - **One file at a time.** Mutations rewrite source, so runs are sequential. A large
   repo is slow; use `--limit` to audit the files you care about.
+- **Xcode projects are detected but impractically slow.** One `xcodebuild test`
+  cycle measured 5m37s, so a 12-mutation audit takes over an hour. Use it on a
+  single file at most, or not at all.
 - **No discoverable test script means refusal, not a guess.** A wrong score is worse
   than no score.
 

@@ -177,13 +177,15 @@ worse than no score.
 
 ## Limits, stated plainly
 
-**Object arguments are reported, not fixed.** `decideState(perception)` takes a shape, not a number. Feeding it `9, 10, 11` throws. `unfake` prints the exact comparison and the case you need to write, and says so instead of generating a broken test. On a real project this was 5 of 9 files.
+**Boundaries on intermediate variables are reported, not fixed.** `const visible = threat.distance <= sight; if (visible && wounded) ...` cannot be probed by varying the distance: all three boundary points return the same value, because the difference only appears when other conditions also hold. `unfake` detects this, refuses to write a test that would pin three identical values, and prints the comparison for a human. On a 5k-line game prototype this was 0 of 9 files fixable — every boundary was an intermediate variable in a state machine.
 
 **Equivalent mutants exist.** Bumping a config constant that no test should pin produces a survivor that is not a defect. The tool filters loop counters, bitwise tricks and shifts, but equivalence cannot be proven in general.
 
-**Runs are sequential.** Mutations rewrite source, so files cannot be processed in parallel. Large repos are slow; use `--limit`.
+**Runs are sequential.** Mutations rewrite source, so files cannot be processed in parallel. A 9-file audit of the game prototype took 80 seconds; large repos need `--limit`.
 
-**JS/TS is the best-covered path.** The Python, Go, Rust and Swift runners are detected and mutated, but the boundary-fixing logic has only been exercised on JS/TS projects so far.
+**Xcode projects are detected but impractically slow.** A single `xcodebuild test` cycle measured 5m37s on a real project, making a 12-mutation audit take over an hour. Technically supported, practically not.
+
+**JS/TS is the best-covered path.** Python, Go, Rust and Swift runners are detected and mutated, but the boundary-fixing logic has only been exercised on JS/TS.
 
 **No discoverable test script means refusal, not a guess.** If the runner cannot be determined from `package.json` or a known config, `unfake` says so and stops. Guessing produced a confidently wrong `0%` score once, which is exactly the failure mode this tool exists to prevent.
 
@@ -191,11 +193,21 @@ worse than no score.
 
 ## Status
 
-Version 0.1.0. 2,239 lines, 34 tests. Zero false positives scanning itself, chalk and slugify.
+Version 0.1.0. 2,797 lines, 45 tests. Zero false positives scanning itself, chalk and slugify.
 
 The self-scan is the honest benchmark: `unfake` run against its own suite reports `0 tests cannot fail, 0 untested edges, 0 do not check values`.
 
-Repository is private for now. The mechanism works and the numbers above are reproducible. The main open gap is object-argument boundaries: reported with a concrete suggestion, not auto-fixed.
+Repository is private for now. The mechanism works and the numbers above are reproducible.
+
+**Validated on:**
+
+| project | stars | score | notes |
+|---|---|---|---|
+| chalk | 23k | 92% | 0 false positives |
+| slugify | 2.7k | 100% | 0 false positives |
+| AI-written cart module | — | 25% | 4 findings, all real |
+| object-field sample | — | 0% → 67% | auto-fixed |
+| 5k-line game prototype | — | 38% | 5 edges reported, 0 auto-fixable |
 
 ---
 
