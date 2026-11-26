@@ -15,6 +15,9 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname } from 'node:path';
 import { join, basename } from 'node:path';
 import { discover } from '../src/discover.js';
 import { baseline, auditFile, run } from '../src/judge.js';
@@ -55,18 +58,31 @@ if (Number.isFinite(nodeMajor) && nodeMajor < 20) {
 }
 
 // --version before anything else: an issue report needs it.
+let VERSION = 'unknown';
+try {
+  const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+  VERSION = JSON.parse(readFileSync(pkgPath, 'utf8')).version;
+} catch { /* running from somewhere without package.json */ }
+
+const ENV_LINE = `crucible ${VERSION} | node ${process.version} | ${process.platform}`;
+
 if (argv.includes('--version') || argv.includes('-v')) {
-  const { readFileSync } = await import('node:fs');
-  const { fileURLToPath } = await import('node:url');
-  const { dirname, join } = await import('node:path');
-  const here = dirname(fileURLToPath(import.meta.url));
-  try {
-    const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'));
-    console.log(`crucible ${pkg.version} | node ${process.version} | ${process.platform}`);
-  } catch {
-    console.log('crucible (version unknown)');
-  }
+  console.log(ENV_LINE);
   process.exit(0);
+}
+
+/**
+ * A way out when the tool cannot work it out itself.
+ *
+ * Only shown when crucible is the one that does not know — an unrecognised language,
+ * an unfamiliar test layout, a crash. Never when the problem is the user's own
+ * failing suite, because that is not our bug and pointing at an issue tracker would
+ * just be noise.
+ */
+const ISSUE_URL = 'https://github.com/aoshuhang/crucible/issues/new?template=wrong-result.md';
+
+function reportHint(what) {
+  return `${C.dim}${what}${C.reset}\n  ${C.dim}report it:${C.reset} ${C.cyan}${ISSUE_URL}${C.reset}\n  ${C.dim}include this line:${C.reset} ${ENV_LINE}`;
 }
 const flags = new Set(argv.filter((a) => a.startsWith('-')));
 const positional = argv.filter((a) => !a.startsWith('-'));
@@ -204,10 +220,11 @@ async function cmdCheck() {
     say(`${C.yellow}No test files were found.${C.reset}`);
     if (project.sourceFiles.length === 0) {
       say(`${C.dim}Nothing in ${project.root} looks like JavaScript, TypeScript, Python, Go, Rust or Swift source.${C.reset}`);
+      say(reportHint('If it is a language crucible should support, that is worth knowing.'));
     } else {
       say(`${C.dim}${project.sourceFiles.length} source file${project.sourceFiles.length === 1 ? '' : 's'} found, but nothing matched a test naming convention`
         + ` (*.test.js, *.spec.ts, test_*.py, *_test.go, *Tests.swift, or a tests/ directory).${C.reset}`);
-      say(`${C.dim}If this project does have tests, please open an issue with the layout — a language it cannot read is worth knowing about.${C.reset}`);
+      say(reportHint('If this project does have tests, the layout is one crucible does not recognise.'));
     }
     return;
   }
@@ -251,8 +268,9 @@ async function cmdScan() {
   const project = await discover(target);
   if (!project.runner) {
     const msg = 'no test runner detected (looked for package.json test script, vitest, jest, ava, mocha, pytest, go, cargo, swift)';
-    if (asJson) return console.log(JSON.stringify({ error: msg }, null, 2));
+    if (asJson) return console.log(JSON.stringify({ error: msg, env: ENV_LINE }, null, 2));
     console.error(`${C.red}${msg}${C.reset}`);
+    console.error(reportHint('That means crucible found the project but not how it runs its tests.'));
     process.exitCode = 2;
     return;
   }
@@ -457,7 +475,8 @@ async function cmdFix() {
 
   const project = await discover(target);
   if (!project.runner) {
-    console.error(`${C.red}no test runner detected${C.reset}`);
+    console.error(`${C.red}no test runner detected (looked for package.json test script, vitest, jest, ava, mocha, pytest, go, cargo, swift)${C.reset}`);
+    console.error(reportHint('That means crucible found the project but not how it runs its tests.'));
     process.exitCode = 2;
     return;
   }
@@ -644,5 +663,31 @@ if (!commands[command]) {
   console.error(`unknown command: ${command}\n\n${USAGE}`);
   process.exit(1);
 }
+
+/**
+ * A crash is our bug, not the user's.
+ *
+ * Without this, an unexpected throw prints a stack trace and nothing else — the
+ * user has no idea whether they did something wrong, and no easy way to tell us.
+ * The exit code stays non-zero so scripts still see a failure.
+ */
+process.on('uncaughtException', (error) => {
+  console.error(`${C.red}crucible crashed.${C.reset} That is a bug here, not in your project.`);
+  console.error('');
+  console.error(`${C.dim}${error && error.stack ? error.stack.split('\n').slice(0, 6).join('\n') : String(error)}${C.reset}`);
+  console.error('');
+  console.error(reportHint('Please include the stack above and the command you ran.'));
+  process.exit(2);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+  console.error(`${C.red}crucible crashed.${C.reset} That is a bug here, not in your project.`);
+  console.error('');
+  console.error(`${C.dim}${error.stack ? error.stack.split('\n').slice(0, 6).join('\n') : String(reason)}${C.reset}`);
+  console.error('');
+  console.error(reportHint('Please include the stack above and the command you ran.'));
+  process.exit(2);
+});
 
 await commands[command]();
