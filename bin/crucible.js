@@ -154,6 +154,8 @@ async function cmdScan() {
       mutationFiles = await mutationPass(project, {
         onProgress: (m) => { if (verbose) say(`  ${C.dim}${m}${C.reset}`); },
       });
+    } else if (base.missing) {
+      suiteError = base.hint ?? 'the test runner could not be started';
     } else {
       suiteError = 'suite is red before mutation, so mutation results would be meaningless';
     }
@@ -208,7 +210,15 @@ async function cmdScan() {
     }, null, 2));
   }
 
-  say(`  runner ${C.cyan}${project.runner.name}${C.reset}${base ? ` ${C.dim}(green in ${base.ms}ms)${C.reset}` : ''}`);
+  const stateLabel = !base
+    ? ''
+    : base.green
+      ? ` ${C.dim}(green in ${base.ms}ms)${C.reset}`
+      : base.missing
+        ? ` ${C.yellow}(runner not found)${C.reset}`
+        : ` ${C.red}(suite is red)${C.reset}`;
+
+  say(`  runner ${C.cyan}${project.runner.name}${C.reset}${stateLabel}`);
   say(`  ${project.sourceFiles.length} source, ${project.testFiles.length} test files`);
   if (suiteError) say(`  ${C.yellow}${suiteError}${C.reset}`);
   say('');

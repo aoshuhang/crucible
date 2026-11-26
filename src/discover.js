@@ -29,6 +29,8 @@ const TEST_PATTERNS = [
   /(^|\/)__tests__\/.*\.[cm]?[jt]sx?$/,  // __tests__/anything.js
   /(^|\/)test\.[cm]?[jt]sx?$/,           // test.js at the project root
   /(^|\/)tests\.[cm]?[jt]sx?$/,          // tests.js
+  /_test\.go$/,                          // foo_test.go  (Go)
+  /_test\.rs$/,                          // tests live in #[cfg(test)] or tests/
   /Tests?\.swift$/,                      // FooTests.swift
   /(^|\/)[^/]+Tests?\.(cs|java|kt)$/,    // FooTest.cs
 ];
@@ -142,7 +144,13 @@ function normalisePath(root, file) {
  *
  * `npm run test` is avoided on purpose: when crucible runs inside a test process,
  * node:test refuses to nest and silently skips the suite, which would make every
- * mutation look like it survived. We call the runner binary directly instead.
+ * mutation look like it survived.
+ *
+ * The command must also work when invoked directly. A bare binary name like `ava`
+ * only resolves inside `npm run`, because npm puts `node_modules/.bin` on PATH.
+ * Run outside it and you get exit 127, which looks exactly like a failing suite —
+ * so every ava, mocha and tap project would be rejected with "suite is red".
+ * Prefixing with `npx --no-install` fixes that without allowing a download.
  */
 async function detectRunner(root) {
   const has = async (name) => {
@@ -185,7 +193,16 @@ async function detectRunner(root) {
         .join(' && ')
         .trim();
 
-      if (cleaned) return { command: cleaned, name: 'package script' };
+      if (cleaned) {
+        // A local binary (ava, mocha, tap) is only on PATH inside `npm run`. Use
+        // `npx --no-install` so it resolves from node_modules/.bin without a
+        // download. `node` and `npx` are already global; leave them alone.
+        const needsNpx = /^(ava|mocha|tap|uvu|jasmine|karma|vitest|jest)\b/.test(cleaned);
+        return {
+          command: needsNpx ? `npx --no-install ${cleaned}` : cleaned,
+          name: 'package script',
+        };
+      }
     }
   }
 
@@ -297,6 +314,19 @@ export async function discover(root) {
       if (re.test(text)) {
         seen.add(src);
         covers.get(src).push(testFile);
+      }
+    }
+
+    // Go convention: `foo_test.go` sits beside `foo.go` in the same package and
+    // calls its functions directly, so there is no import to resolve. Match by
+    // name and directory instead.
+    const goTest = testFile.match(/^(.*)\/([^/]+)_test\.go$/);
+    if (goTest) {
+      const [, dir, base] = goTest;
+      const sibling = byKey.get(normalisePath(abs, `${dir}/${base}.go`));
+      if (sibling && !seen.has(sibling)) {
+        seen.add(sibling);
+        covers.get(sibling).push(testFile);
       }
     }
   }

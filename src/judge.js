@@ -114,13 +114,35 @@ export async function judgeMutation({ root, file, command, mutation, timeoutMs =
 /**
  * Verify the baseline: the suite must pass before any mutation, otherwise every
  * result is meaningless (we would report SURVIVED for a suite that is already red).
+ *
+ * When the runner itself is missing, that is not a failing suite — it is a setup
+ * problem, and telling the user "suite is red" would send them looking for a broken
+ * test that does not exist. Exit 127 and "command not found" are reported as
+ * `missing` instead.
  */
 export async function baseline({ root, command, timeoutMs = 180_000 }) {
   const result = await run(command, root, timeoutMs);
+  const output = result.stdout + result.stderr;
+
+  const missing = result.code === 127
+    || /command not found|No module named|not found in \$PATH|cannot find package/i.test(output);
+
+  if (missing) {
+    return {
+      green: false,
+      missing: true,
+      ms: result.ms,
+      command,
+      output: output.slice(-1500),
+      hint: `the test runner is not installed: \`${command}\` could not run. Install its dependencies, then try again.`,
+    };
+  }
+
   return {
     green: result.ok,
+    missing: false,
     ms: result.ms,
-    output: (result.stdout + result.stderr).slice(-4000),
+    output: output.slice(-4000),
   };
 }
 
