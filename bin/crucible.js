@@ -28,6 +28,7 @@ import { fixObjectBoundary } from '../src/fix-object.js';
 import { nextStepFor, planFor } from '../src/next.js';
 import { mapComparisonsToFunctions } from '../src/fix-boundary.js';
 import { mayWrite, stamp } from '../src/guard.js';
+import { relPosix, baseName, stem } from '../src/paths.js';
 
 const C = {
   reset: '\u001b[0m', dim: '\u001b[2m', bold: '\u001b[1m',
@@ -36,9 +37,26 @@ const C = {
 };
 
 const argv = process.argv.slice(2);
+
+// --version before anything else: an issue report needs it.
+if (argv.includes('--version') || argv.includes('-v')) {
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, join } = await import('node:path');
+  const here = dirname(fileURLToPath(import.meta.url));
+  try {
+    const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'));
+    console.log(`crucible ${pkg.version} | node ${process.version} | ${process.platform}`);
+  } catch {
+    console.log('crucible (version unknown)');
+  }
+  process.exit(0);
+}
 const flags = new Set(argv.filter((a) => a.startsWith('-')));
 const positional = argv.filter((a) => !a.startsWith('-'));
-const command = positional[0] ?? 'scan';
+// No command prints help. Defaulting to `scan` meant a curious first run spent a
+// minute mutating whatever directory you happened to be in.
+const command = positional[0] ?? null;
 const target = positional[1] ?? process.cwd();
 
 const asJson = flags.has('--json');
@@ -75,7 +93,7 @@ async function staticPass(project) {
       continue;
     }
 
-    const rel = testFile.replace(project.root + '/', '');
+    const rel = relPosix(project.root, testFile);
     for (const f of scanTestSource(text, rel)) {
       findings.push({ ...f, confidence: gradeFinding(f) });
     }
@@ -113,12 +131,12 @@ async function mutationPass(project, { onProgress } = {}) {
 
     files.push({
       ...result,
-      relFile: sourceFile.replace(project.root + '/', ''),
-      testFiles: testFiles.map((t) => t.replace(project.root + '/', '')),
+      relFile: relPosix(project.root, sourceFile),
+      testFiles: testFiles.map((t) => relPosix(project.root, t)),
       grade,
       survivorFindings: ranked.filter((s) => s.boundary || s.threshold).map((s) => ({
         id: 'untested-boundary',
-        file: sourceFile.replace(project.root + '/', ''),
+        file: relPosix(project.root, sourceFile),
         line: s.mutation.line,
         kind: 'boundary',
         snippet: s.described,
@@ -213,7 +231,7 @@ async function cmdScan() {
   // is covered would read as "healthy", which is the opposite of the truth.
   const uncovered = [...project.covers.entries()]
     .filter(([, tests]) => tests.length === 0)
-    .map(([src]) => src.replace(project.root + '/', ''));
+    .map(([src]) => relPosix(project.root, src));
 
   // Static findings need no execution, so report them even if the suite is red.
   const staticFindings = await staticPass(project);
@@ -426,7 +444,7 @@ async function cmdFix() {
   const written = [];
 
   for (const [sourceFile, testFiles] of covered.slice(0, maxFiles)) {
-    const rel = sourceFile.replace(project.root + '/', '');
+    const rel = relPosix(project.root, sourceFile);
 
     // 1. Boundaries first. This is the fix that kills real off-by-one bugs.
     const boundary = await fixBoundaries({
@@ -440,7 +458,7 @@ async function cmdFix() {
 
     if (boundary.written) {
       written.push({ fixPath: boundary.written, kind: 'boundary' });
-      say(`  ${C.green}wrote${C.reset} ${boundary.written.replace(project.root + '/', '')}`
+      say(`  ${C.green}wrote${C.reset} ${relPosix(project.root, boundary.written)}`
         + ` ${C.dim}(${boundary.cases} boundary comparison${boundary.cases === 1 ? '' : 's'} pinned)${C.reset}`);
       continue;
     }
@@ -469,7 +487,7 @@ async function cmdFix() {
         if (result.written) {
           objectFixed += 1;
           written.push({ fixPath: result.written, kind: 'object-boundary' });
-          say(`  ${C.green}wrote${C.reset} ${result.written.replace(project.root + '/', '')}`
+          say(`  ${C.green}wrote${C.reset} ${relPosix(project.root, result.written)}`
             + ` ${C.dim}(${fn}: ${comparison.left} ${comparison.op} ${comparison.right})${C.reset}`);
         }
       }
@@ -523,12 +541,12 @@ async function cmdFix() {
 
       const gate = await mayWrite(fixPath, { force });
       if (!gate.write) {
-        say(`  ${C.yellow}skip${C.reset} ${fixPath.replace(project.root + '/', '')} ${C.dim}(${gate.reason})${C.reset}`);
+        say(`  ${C.yellow}skip${C.reset} ${relPosix(project.root, fixPath)} ${C.dim}(${gate.reason})${C.reset}`);
         continue;
       }
       await fs.writeFile(fixPath, stamp(body, 'js'), 'utf8');
       written.push({ fixPath, kind: 'values' });
-      say(`  ${C.green}wrote${C.reset} ${fixPath.replace(project.root + '/', '')}`
+      say(`  ${C.green}wrote${C.reset} ${relPosix(project.root, fixPath)}`
         + ` ${C.dim}(${probed.length} calls pinned)${C.reset}`);
     } finally {
       await fs.rm(probePath, { force: true });
@@ -558,22 +576,42 @@ async function cmdVerify() {
 
 const commands = { check: cmdCheck, scan: cmdScan, fix: cmdFix, verify: cmdVerify };
 
-if (!commands[command]) {
-  console.error(`unknown command: ${command}
+const USAGE = `usage:
+  crucible check  [dir]   fast: read the tests, report those that cannot fail
+  crucible scan   [dir]   slow: mutate the source, find untested boundaries
+  crucible fix    [dir]   write the boundary tests that were missing
+  crucible verify [dir]   re-run the audit after a fix
 
-usage:
-  crucible scan   [dir]   report tests that cannot fail
-  crucible fix    [dir]   write regression tests that pin real values
-  crucible verify [dir]   re-run after a fix
+  [dir] defaults to the current directory.
 
 options:
-  --json           machine-readable output
-  --verbose        show each mutation as it runs
-  --no-mutation    static checks only (fast, no test runs)
-  --limit=N        audit at most N source files (default 12)
-  --profile=NAME   logic (default, skips tuning constants) or strict
-  --allow-env-noise audit even when the runner reports unhandled environment errors
-  --force          overwrite generated test files the user has edited`);
+  --json            machine-readable output, with a next step per finding
+  --limit=N         scan: audit at most N source files (default 12)
+  --verbose         scan: print each mutation as it runs
+  --no-mutation     scan: static checks only, no test runs
+  --profile=NAME    scan: logic (default, skips tuning constants) or strict
+  --allow-env-noise scan: audit even when the runner exits on an environment error
+  --force           fix: overwrite a generated test file edited by hand
+  --version, -v     print the version and platform
+
+examples:
+  crucible check                 # is anything obviously broken?
+  crucible check src/            # just one directory
+  crucible scan --limit=3        # deeper look at three files
+  crucible fix && crucible verify
+
+exit codes:
+  0  nothing certainly wrong
+  1  something cannot fail (check, scan) or the suite went red after a fix
+  2  could not run at all`;
+
+if (!command) {
+  console.log(USAGE);
+  process.exit(0);
+}
+
+if (!commands[command]) {
+  console.error(`unknown command: ${command}\n\n${USAGE}`);
   process.exit(1);
 }
 

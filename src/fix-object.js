@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { placement, parseProbeOutput } from './fix.js';
 import { run } from './judge.js';
 import { mayWrite, stamp } from './guard.js';
+import { stem } from './paths.js';
 
 /**
  * Extract `const NAME: Type = { ... };` literals from a test file.
@@ -494,7 +495,7 @@ export async function fixObjectBoundary(options) {
     const body = buildObjectTest({
       importPath,
       fn,
-      sourceName: sourceFile.split('/').pop().replace(/\.[^.]+$/, ''),
+      sourceName: stem(sourceFile),
       runner,
       baseText: carrier.literal.text,
       kind: carrier.kind,

@@ -1,5 +1,11 @@
 # crucible
 
+> **Status: 0.1.0, early.** Built and tested against six real projects on macOS.
+> When it cannot determine something it refuses and says why, rather than guessing —
+> that is the main design goal, because a wrong test-quality score is worse than no
+> score. Expect rough edges anyway. Windows is untested (see [Platforms](#platforms)).
+> Counter-examples and bug reports are genuinely useful.
+
 **Find the tests that cannot fail. Then fix them.**
 
 AI writes tests that pass. That is not the same as tests that test anything.
@@ -265,20 +271,31 @@ Run it on a clean working tree anyway — that is what git is for.
 
 ## Does it work on real code
 
-| project | stars | mutation score | false positives |
+`crucible check` run against six real projects. The number that matters is the
+middle column: how many tests it wrongly accuses.
+
+| project | test files | **false positives** | flagged for review |
 |---|---|---|---|
-| **chalk** | 23k | **92%** (94% full) | 0 |
-| **slugify** | 2.7k | **91%** | 0 |
-| AI-written sample | — | **42%** (44% full) | 4 findings |
-| object-field sample | — | 0% → **67%** after fix |
-| 5k-line game prototype | — | **52%** | 17 edges |
+| **axios** | 185 | **0** | 159 |
+| **express** | 92 | **0** | 18 |
+| **lodash** | 6 | **0** | 84 |
+| **p-map** | 1 | **0** | 0 |
+| **chalk** | 8 | **0** | 0 |
+| **slugify** | 1 | **0** | 0 |
+| a known-bad sample | 1 | — | 3 |
 
-Mature projects score high and `crucible` says nothing about them. The AI-written
-sample is the control: six green tests over a small cart module, four real problems
-found, none of which would catch a bug.
+Zero false positives on 293 test files is the claim this tool lives or dies on. It
+took six rounds of running against real repositories to get there — the first
+version reported 282 problems in p-map alone, all of them well-written ava tests.
 
-Full methodology, including the runner-detection bug that produced a confidently
-wrong `0%` before it was caught, is in [RELEASE.md](RELEASE.md).
+The known-bad sample is the control: one test that calls `clamp()` and asserts
+nothing, correctly reported.
+
+`scan` also produces a mutation score on the slow path. chalk scores 92% (94% on a
+full run), slugify 91%, and a 5k-line game prototype 52%.
+
+Full methodology, including the two occasions this tool reported a number that
+flattered the suite, is in [RELEASE.md](RELEASE.md).
 
 ## For coding agents
 
@@ -387,6 +404,30 @@ On a real project (a 5k-line game prototype) this split was 0 of 9 files fixable
 every boundary was an intermediate variable in a state machine. That is an honest
 result, not a failure — the report still names all 5 untested edges with the exact
 expression.
+
+## Platforms
+
+| platform | state |
+|---|---|
+| macOS | developed and tested here |
+| Linux | expected to work; the shell commands and path handling are portable |
+| Windows | **untested.** Path handling and shell quoting were written to be portable, but nobody has run it. If you do, an issue either way is useful. |
+
+Node 20 or newer. No other requirements.
+
+## When it does not work
+
+| symptom | what it means |
+|---|---|
+| `no test runner detected` | the test command is not in `package.json`, and no known config file was found. Say how the project runs its tests in an issue — guessing a glob is how the tool reports `0%` about a healthy suite. |
+| `dependencies are not installed` | run the install step the message names (`pnpm install`, `pip install -e .`, …) |
+| `environment error` | the tests pass but the runner exits non-zero — a missing browser, an unreachable host. The message names the fix. |
+| `suite is red` | real test failures. Fix them first; mutation results would be meaningless. |
+| `file is not writable` | that source file was skipped. Nothing was changed. |
+| score looks too low | run with `--profile=strict` to include tuning constants, and check `--limit` covered the files you care about. |
+
+If a report looks wrong — a test you know is fine gets flagged — that is the most
+valuable bug you can file. Include the test file and the command output.
 
 ## Limits, stated plainly
 

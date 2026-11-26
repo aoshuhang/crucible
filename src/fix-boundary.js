@@ -14,6 +14,7 @@ import { comparisonsIn, boundaryValues, boundarySensitive, resolveConstant } fro
 import { exportedNames, buildBoundaryTest, buildBoundaryProbe, parseProbeOutput, placement, suggestManualBoundary } from './fix.js';
 import { run } from './judge.js';
 import { mayWrite, stamp } from './guard.js';
+import { stem } from './paths.js';
 
 /**
  * Only comparisons whose function takes a numeric argument can be fixed
@@ -247,7 +248,7 @@ export async function fixBoundaries(options) {
 
       const pyBody = buildPythonBoundaryTest({
         importPath,
-        sourceName: sourceFile.split('/').pop().replace(/\.py$/, ''),
+        sourceName: stem(sourceFile),
         cases: usablePy,
       });
 
@@ -287,7 +288,7 @@ export async function fixBoundaries(options) {
 
     const body = buildBoundaryTest({
       importPath,
-      sourceName: sourceFile.split('/').pop().replace(/\.[^.]+$/, ''),
+      sourceName: stem(sourceFile),
       runner,
       cases: usable,
     });

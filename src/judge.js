@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { mutationsFor, applyMutation } from './mutate.js';
+import { relPosix, baseName } from './paths.js';
 
 /** Run a shell command in a directory, capturing output. Never throws. */
 export function run(command, cwd, timeoutMs = 120_000) {
@@ -63,7 +64,7 @@ export function narrowCommand({ command, testFiles, root }) {
   const base = addFailFast(command);
   if (!testFiles || testFiles.length === 0) return base;
 
-  const rels = testFiles.map((f) => f.replace(root + '/', '')).filter(Boolean);
+  const rels = testFiles.map((f) => relPosix(root, f)).filter(Boolean);
   if (rels.length === 0) return base;
 
   // Narrow even when many files cover the source: 17 files out of axios's 185 is
@@ -397,7 +398,7 @@ export async function auditFile({ root, file, command, maxMutations = 12, profil
 
   const results = [];
   for (const mutation of picked) {
-    onProgress?.(`${file.split('/').pop()}:${mutation.line} ${mutation.description}`);
+    onProgress?.(`${baseName(file)}:${mutation.line} ${mutation.description}`);
     const outcome = await judgeMutation({ root, file, command: effective, mutation, timeoutMs });
     results.push({ mutation, ...outcome });
   }
