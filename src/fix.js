@@ -356,6 +356,28 @@ export function suggestManualBoundary({ fn, comparison, sourceLines }) {
  */
 export function placement({ sourceFile, testFiles, root }) {
   const ext = extname(sourceFile);
+  const isPython = ext === '.py';
+
+  if (isPython) {
+    // pytest convention: tests live in test_<module>.py.
+    const near = testFiles.find((t) => /\/(tests?|__tests__)\//.test(t));
+    const dir = near ? dirname(near) : dirname(sourceFile);
+    const base = basename(sourceFile).replace(/\.py$/, '');
+    const fixPath = join(dir, `test_${base}_exact.py`);
+
+    // Python needs a package-root import. The generated file inserts the project
+    // root on sys.path so `src.limits` resolves regardless of where it is run from.
+    const rel = relative(root, sourceFile).replace(/\\/g, '/').replace(/\.py$/, '').split('/').join('.');
+
+    return {
+      fixPath,
+      importPath: rel,
+      moduleFile: basename(sourceFile).replace(/\.py$/, ''),
+      dir,
+      probeName: `test___crucible_probe.py`,
+      python: true,
+    };
+  }
 
   // Follow the project's own extension so a .js project does not get a .ts probe
   // that its runner cannot parse.
@@ -376,5 +398,5 @@ export function placement({ sourceFile, testFiles, root }) {
   if (isTs) rel = rel.replace(/\.(ts|tsx)$/, '');
   if (!rel.startsWith('.')) rel = `./${rel}`;
 
-  return { fixPath, importPath: rel, dir, probeName: `__crucible_probe${probeExt}` };
+  return { fixPath, importPath: rel, dir, probeName: `__crucible_probe${probeExt}`, python: false };
 }

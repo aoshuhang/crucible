@@ -50,14 +50,25 @@ export function numericThreshold(right) {
 
 /**
  * Resolve an identifier to its literal value from the same module.
- * `const MAX = 10;` → 10. Handles `export const` too.
+ *
+ * Handles `const MAX = 10`, `export const MAX = 10`, and Python's bare
+ * `MAX_ITEMS = 10` — Python has no declaration keyword, so the pattern has to be
+ * anchored to the start of a line to avoid matching an assignment inside a body.
  */
 export function resolveConstant(source, name) {
-  const re = new RegExp(`(?:export\\s+)?const\\s+${name}\\s*=\\s*(-?[\\d.]+)\\b`);
-  const m = source.match(re);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? n : null;
+  const patterns = [
+    new RegExp(`(?:export\\s+)?const\\s+${name}\\s*=\\s*(-?[\\d.]+)\\b`),
+    new RegExp(`^${name}\\s*=\\s*(-?[\\d.]+)\\b`, 'm'),
+  ];
+
+  for (const re of patterns) {
+    const m = source.match(re);
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (Number.isFinite(n)) return n;
+  }
+
+  return null;
 }
 
 /**

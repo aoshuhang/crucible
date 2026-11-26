@@ -248,10 +248,10 @@ async function detectRunner(root) {
     }
   }
 
-  if (await has('package.json')) {
-    return { command: 'node --test --test-concurrency=1 "tests/*.test.js"', name: 'node:test' };
-  }
-
+  // No fallback glob. Guessing `tests/*.test.js` on a project whose tests live
+  // elsewhere runs zero tests, the suite is always green, and every mutation is
+  // reported as a survivor — a confident 0% about a healthy project. Reporting
+  // "no runner" is the honest answer, and the caller turns it into a clear error.
   return null;
 }
 
