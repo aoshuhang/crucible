@@ -1,5 +1,5 @@
 {
-  "name": "crucible",
+  "name": "@hsaohuang/crucible",
   "version": "0.1.0",
   "description": "Find AI-generated tests that assert nothing, then rewrite them until they actually catch bugs.",
   "type": "module",
@@ -35,5 +35,8 @@
   "bugs": {
     "url": "https://github.com/aoshuhang/crucible/issues"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }

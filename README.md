@@ -28,13 +28,16 @@ account.
 **Nothing installed, run it now:**
 
 ```bash
-npx crucible check
+npx @hsaohuang/crucible check
 ```
+
+The package is scoped because the unscoped name `crucible` is held by an unrelated
+author on npm. After installing, the command is plain `crucible`.
 
 **Or install globally:**
 
 ```bash
-npm install -g crucible
+npm install -g @hsaohuang/crucible
 crucible check
 ```
 
@@ -227,7 +230,7 @@ all a pre-commit hook or a CI step needs:
 ```bash
 # .git/hooks/pre-commit
 #!/bin/sh
-npx crucible check || {
+npx @hsaohuang/crucible check || {
   echo "Some tests cannot fail. Fix them, or commit with --no-verify."
   exit 1
 }
@@ -316,8 +319,8 @@ ordered `plan` and a `next` block on every finding:
 {
   "plan": {
     "steps": [
-      { "order": 1, "action": "run_command", "command": "npx crucible fix \"/repo\"" },
-      { "order": 2, "action": "verify", "command": "npx crucible scan \"/repo\" --json" }
+      { "order": 1, "action": "run_command", "command": "npx @hsaohuang/crucible fix \"/repo\"" },
+      { "order": 2, "action": "verify", "command": "npx @hsaohuang/crucible scan \"/repo\" --json" }
     ],
     "doNotClaim": [
       "that the tests are real without re-running scan",

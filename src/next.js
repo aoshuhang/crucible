@@ -34,7 +34,7 @@ export function nextStepFor(finding, context) {
   if (AUTO_FIXABLE.has(finding.id) || AUTO_FIXABLE.has(finding.kind)) {
     return {
       kind: 'run_command',
-      command: `npx crucible fix ${JSON.stringify(context.root)}`,
+      command: `npx @hsaohuang/crucible fix ${JSON.stringify(context.root)}`,
       instruction: 'Writes the boundary test. Re-run scan afterwards to confirm the score moved.',
     };
   }
@@ -101,7 +101,7 @@ export function planFor({ findings, summary, suiteGreen, root }) {
     steps.push({
       order: steps.length + 1,
       action: 'run_command',
-      command: `npx crucible fix ${JSON.stringify(root)}`,
+      command: `npx @hsaohuang/crucible fix ${JSON.stringify(root)}`,
       why: `${likely.length + certain.length} findings may be auto-fixable; run it before editing by hand`,
     });
   }
@@ -125,7 +125,7 @@ export function planFor({ findings, summary, suiteGreen, root }) {
   steps.push({
     order: steps.length + 1,
     action: 'verify',
-    command: `npx crucible scan ${JSON.stringify(root)} --json`,
+    command: `npx @hsaohuang/crucible scan ${JSON.stringify(root)} --json`,
     why: 'the score must move; do not report success without it',
   });
 

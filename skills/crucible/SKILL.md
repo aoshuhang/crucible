@@ -26,9 +26,9 @@ which is correct.
 ## How to run it
 
 ```bash
-npx crucible scan <dir> --json        # diagnose
-npx crucible fix <dir>                # write the missing tests
-npx crucible scan <dir> --json        # verify the score moved
+npx @hsaohuang/crucible check <dir>   # fast: which tests cannot fail
+npx @hsaohuang/crucible scan <dir> --json   # slow: untested boundaries
+npx @hsaohuang/crucible fix <dir>     # write the missing tests
 ```
 
 `scan` runs the project's tests once per mutation. On a real project that is
