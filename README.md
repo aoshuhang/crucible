@@ -169,6 +169,51 @@ found, none of which would catch a bug.
 Full methodology, including the runner-detection bug that produced a confidently
 wrong `0%` before it was caught, is in [RELEASE.md](RELEASE.md).
 
+## For coding agents
+
+Two things make it usable by an agent rather than only by a human.
+
+**A skill, so the agent notices it.** `skills/crucible/SKILL.md` ships in the repo.
+Install it by symlinking into your agent's skill directory:
+
+```bash
+ln -s "$PWD/skills/crucible" ~/.config/opencode/skills/crucible   # OpenCode
+ln -s "$PWD/skills/crucible" ~/.claude/skills/crucible            # Claude Code
+```
+
+**A machine-readable plan, so the agent knows what to do.** `--json` carries an
+ordered `plan` and a `next` block on every finding:
+
+```json
+{
+  "plan": {
+    "steps": [
+      { "order": 1, "action": "run_command", "command": "npx crucible fix \"/repo\"" },
+      { "order": 2, "action": "verify", "command": "npx crucible scan \"/repo\" --json" }
+    ],
+    "doNotClaim": [
+      "that the tests are real without re-running scan",
+      "that 3 suspect findings are defects — they may be intentional property tests"
+    ]
+  },
+  "findings": [{
+    "id": "no-assertion",
+    "file": "test/cart.test.js",
+    "line": 10,
+    "confidence": "certain",
+    "next": {
+      "kind": "edit_test",
+      "file": "test/cart.test.js",
+      "line": 10,
+      "instruction": "Add an assertion to the test at test/cart.test.js:10, or delete the test if it covers nothing."
+    }
+  }]
+}
+```
+
+The `doNotClaim` list exists because an agent will otherwise report "tests are now
+real" after running `fix`, without checking whether the score moved.
+
 ## Two profiles
 
 A tuning constant is not a test-quality signal. `let maxHealth = 34` should not

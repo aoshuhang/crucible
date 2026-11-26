@@ -1,0 +1,90 @@
+---
+name: crucible
+description: Verify that tests actually catch bugs. Use when tests were just written or generated, when the user asks whether their tests are real or meaningful, when coverage looks high but bugs keep shipping, when the user asks to "check the tests", "audit the test suite" or "make tests stronger", or before declaring a task done that involved writing tests. Runs mutation testing: breaks source on purpose and reports which breaks the suite never noticed.
+---
+
+# Crucible
+
+A test suite is a crucible: it either shows the flaws in the metal or it does not.
+Most AI-written tests pass forever because they assert nothing — the type, the
+shape, the truthiness. `crucible` finds them by breaking the source on purpose and
+checking whether the suite notices, then writes the test that would have caught it.
+
+## When to run it
+
+Run it whenever tests were part of the work and you are about to say the work is
+done. Specifically:
+
+- You just wrote or modified tests.
+- The user asks whether the tests are meaningful, real, or worth having.
+- A project has high coverage but the user keeps finding bugs.
+- The user says "check my tests", "audit the tests", "are these tests fake".
+
+Do not run it on a project whose suite is already failing — the command refuses,
+which is correct.
+
+## How to run it
+
+```bash
+npx crucible scan <dir> --json        # diagnose
+npx crucible fix <dir>                # write the missing tests
+npx crucible scan <dir> --json        # verify the score moved
+```
+
+`scan` runs the project's tests once per mutation. On a real project that is
+**seconds to minutes**, not instant. Tell the user you are running it before you
+start, and use `--limit=N` (default 12) to keep it bounded.
+
+Read the JSON, not the human output, when you need to act on it:
+
+```json
+{
+  "summary": { "fakeTests": 2, "likelyFake": 4, "worthChecking": 3 },
+  "findings": [
+    {
+      "id": "no-assertion",
+      "file": "test/cart.test.js",
+      "line": 10,
+      "kind": "empty",
+      "snippet": "it('clamp runs')",
+      "why": "test runs code but never asserts anything",
+      "fix": "assert on the result, or delete the test",
+      "confidence": "certain"
+    }
+  ]
+}
+```
+
+## How to read the confidence grades
+
+This is the part that decides what you are allowed to claim.
+
+| grade | meaning | what to do |
+|---|---|---|
+| `certain` | provable by reading one line | fix it, no debate |
+| `likely` | a deliberate break went unnoticed | fix it, it is almost certainly a gap |
+| `suspect` | tests do pin values; may be intentional | mention it, do not call it a fake test |
+
+Never tell the user their tests are fake based on a `suspect` finding. A property
+test on a noise function legitimately survives a constant tweak.
+
+## What `fix` cannot do
+
+It refuses to write a test when the comparison feeds an intermediate variable that
+several branches consume — probing the boundary would return the same value three
+times, and the resulting test would pin three identical values and catch nothing.
+That is the exact defect the tool exists to find, so it declines and prints the
+comparison for a human instead.
+
+When the output says `manual`, write that test yourself. It tells you the
+expression and the case you need.
+
+## Do not do this
+
+- Do not run `fix` and then claim the tests are now real without re-running `scan`
+  to see the score move.
+- Do not treat a low score as a verdict on the developer. A 52% score on a game
+  prototype with a state machine is normal; the useful part is the list of specific
+  untested edges.
+- Do not run it on Xcode projects. One `xcodebuild test` cycle was measured at
+  5m37s, so an audit takes over an hour. Say so instead.

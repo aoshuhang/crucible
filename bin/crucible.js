@@ -25,6 +25,7 @@ import { exportedNames, harvestCallSites, buildProbe, parseProbeOutput,
   buildFixTest, placement } from '../src/fix.js';
 import { fixBoundaries } from '../src/fix-boundary.js';
 import { fixObjectBoundary } from '../src/fix-object.js';
+import { nextStepFor, planFor } from '../src/next.js';
 import { mapComparisonsToFunctions } from '../src/fix-boundary.js';
 
 const C = {
@@ -179,13 +180,23 @@ async function cmdScan() {
   const summary = headline(deduped);
 
   if (asJson) {
+    // Each finding carries the next action, and the run carries an ordered plan.
+    // An agent should not have to interpret the report, only execute it.
+    const enriched = allFindings.map((f) => ({ ...f, next: nextStepFor(f, { root: project.root }) }));
+
     return console.log(JSON.stringify({
       root: project.root,
       runner: project.runner.name,
       baselineMs: base?.ms ?? null,
       suiteError,
       summary,
-      findings: allFindings,
+      plan: planFor({
+        findings: enriched,
+        summary,
+        suiteGreen: base ? base.green : false,
+        root: project.root,
+      }),
+      findings: enriched,
       files: mutationFiles.map((f) => ({
         file: f.relFile,
         score: f.score,
