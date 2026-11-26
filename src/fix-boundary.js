@@ -9,12 +9,51 @@
  */
 
 import { readFile, writeFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { comparisonsIn, boundaryValues, boundarySensitive, resolveConstant } from './boundary-values.js';
+import { join, extname } from 'node:path';
+import { comparisonsIn, boundaryValues, boundarySensitive } from './boundary-values.js';
 import { exportedNames, buildBoundaryTest, buildBoundaryProbe, parseProbeOutput, placement, suggestManualBoundary } from './fix.js';
-import { run } from './judge.js';
+import { run, addFailFast, registerTempFile, unregisterTempFile } from './judge.js';
 import { mayWrite, stamp } from './guard.js';
-import { stem } from './paths.js';
+import { stem, relPosix } from './paths.js';
+
+/**
+ * Read the real return values at the boundary.
+ *
+ * Plain JavaScript resolves under `node` directly, which is fast and cannot run
+ * the whole suite. TypeScript (and JSX) only resolve under the project's own
+ * runner — crucible strips the extension from the generated import so the
+ * bundler-style resolver the tests use can find the file, and plain `node` cannot
+ * resolve an extensionless specifier. Running it anyway used to fail with
+ * ERR_MODULE_NOT_FOUND and made every TS boundary fix silently fall back.
+ */
+async function probeValues({ root, sourceFile, probePath, runnerName, fullCommand }) {
+  const ext = extname(sourceFile).toLowerCase();
+  const plainJs = ext === '.js' || ext === '.mjs' || ext === '.cjs';
+
+  if (plainJs) {
+    const result = await run(`node ${JSON.stringify(probePath)}`, root, 60_000);
+    return parseProbeOutput(result.stdout + result.stderr);
+  }
+
+  const rel = relPosix(root, probePath);
+  const narrow = runnerName === 'vitest'
+    ? `./node_modules/.bin/vitest run ${JSON.stringify(rel)}`
+    : runnerName === 'jest'
+      ? `./node_modules/.bin/jest ${JSON.stringify(rel)} --ci`
+      : `node --test ${JSON.stringify(rel)}`;
+
+  const narrowRun = await run(narrow, root, 120_000);
+  const parsed = parseProbeOutput(narrowRun.stdout + narrowRun.stderr);
+  if (parsed) return parsed;
+
+  // Last resort: the project's own test command, which certainly understands its
+  // language. The probe is a `.test` file, so it is picked up by the suite glob.
+  if (fullCommand) {
+    const fullRun = await run(addFailFast(fullCommand), root, 180_000);
+    return parseProbeOutput(fullRun.stdout + fullRun.stderr);
+  }
+  return null;
+}
 
 /**
  * Only comparisons whose function takes a numeric argument can be fixed
@@ -197,7 +236,14 @@ export async function fixBoundaries(options) {
   }
 
   const { fixPath, importPath, dir, probeName, python } = placement({ sourceFile, testFiles, root });
-  const probePath = join(dir, probeName);
+
+  // Plain JavaScript probes run under `node` directly, so the file must be ESM no
+  // matter what the package's `type` says; `.js` in a CommonJS package is parsed as
+  // CJS and fails on its own import statement. TypeScript keeps the runner-visible
+  // name, and Python keeps its `.py` probe.
+  const plainJs = !python && /\.(js|mjs|cjs)$/i.test(sourceFile);
+  const probePath = join(dir, plainJs ? '__crucible_boundary.probe.mjs' : probeName);
+  registerTempFile(probePath);
 
   try {
     if (python) {
@@ -261,10 +307,13 @@ export async function fixBoundaries(options) {
     const probeBody = buildBoundaryProbe({ importPath, cases });
     await writeFile(probePath, probeBody, 'utf8');
 
-    // Run the probe directly with node: it must not go through the project's test
-    // runner, which would skip it when crucible itself runs inside a test process.
-    const probeRun = await run(`node ${JSON.stringify(probePath)}`, root, 60_000);
-    const probed = parseProbeOutput(probeRun.stdout + probeRun.stderr);
+    const probed = await probeValues({
+      root,
+      sourceFile,
+      probePath,
+      runnerName,
+      fullCommand: runner,
+    });
 
     if (!probed || probed.length === 0) {
       return { written: null, cases: 0, reason: 'probe produced no values (does the function take a number?)' };
@@ -289,7 +338,7 @@ export async function fixBoundaries(options) {
     const body = buildBoundaryTest({
       importPath,
       sourceName: stem(sourceFile),
-      runner,
+      runner: runnerName,
       cases: usable,
     });
 
@@ -300,5 +349,6 @@ export async function fixBoundaries(options) {
     return { written: fixPath, cases: usable.length };
   } finally {
     await rm(probePath, { force: true });
+    unregisterTempFile(probePath);
   }
 }

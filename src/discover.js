@@ -41,6 +41,16 @@ const SOURCE_EXT = new Set([
   '.py', '.go', '.rs', '.swift', '.java', '.kt', '.cs',
 ]);
 
+/**
+ * Source formats people reasonably expect to be audited but that crucible does not
+ * parse. Counting them matters: silently skipping every `.vue` file in a Vue project
+ * looks exactly like a clean report.
+ */
+const UNSUPPORTED_SOURCE_EXT = new Set([
+  '.vue', '.svelte', '.astro', '.rb', '.php', '.scala', '.ex', '.exs', '.erl',
+  '.hs', '.clj', '.cljs', '.dart', '.lua', '.fs', '.jl', '.m', '.mm',
+]);
+
 /** Files that are entry points or config, not worth mutating. */
 const SKIP_SOURCE = /(^|\/)(main|setup|config|vite\.config|jest\.config|vitest\.config|webpack\.config|rollup\.config|tsup\.config|eslint\.config)\.[cm]?[jt]sx?$/;
 
@@ -96,8 +106,14 @@ async function walk(dir, root, acc, depth = 0) {
     }
 
     if (!entry.isFile()) continue;
-    const ext = extname(entry.name);
-    if (!SOURCE_EXT.has(ext)) continue;
+    const ext = extname(entry.name).toLowerCase();
+    if (!SOURCE_EXT.has(ext)) {
+      if (UNSUPPORTED_SOURCE_EXT.has(ext)) {
+        if (!acc.unsupported) acc.unsupported = new Map();
+        acc.unsupported.set(ext, (acc.unsupported.get(ext) ?? 0) + 1);
+      }
+      continue;
+    }
 
     const isTest = TEST_PATTERNS.some((re) => re.test(relative(root, full).split('\\').join('/')));
     if (isTest) acc.testFiles.push(full);
@@ -384,8 +400,151 @@ async function detectRunner(root) {
  * @param {string} root
  * @returns {Promise<Project>}
  */
+/**
+ * The nearest directory that looks like a project root.
+ *
+ * A single-file target has to know where the runner lives; its own directory is
+ * often a deep `src/` folder with no package.json anywhere near it.
+ */
+async function findProjectRoot(start) {
+  let dir = start;
+  for (;;) {
+    for (const marker of ['package.json', 'pyproject.toml', 'pytest.ini', 'tox.ini',
+      'go.mod', 'Cargo.toml', 'Package.swift']) {
+      try {
+        await stat(join(dir, marker));
+        return dir;
+      } catch { /* keep walking up */ }
+    }
+    try {
+      await stat(join(dir, '.git'));
+      return dir;
+    } catch { /* keep walking up */ }
+
+    const parent = dirname(dir);
+    if (parent === dir) return start;
+    dir = parent;
+  }
+}
+
+/**
+ * Audit one file, discovered from the project it belongs to.
+ *
+ * `crucible scan src/foo.ts` is the natural thing to type while working on one
+ * file. Walking a file path used to find nothing and then blame the runner.
+ */
+async function discoverFile(file) {
+  const projectRoot = await findProjectRoot(dirname(file));
+  const full = await discover(projectRoot);
+  const rel = relative(projectRoot, file).split('\\').join('/');
+  const isTest = TEST_PATTERNS.some((re) => re.test(rel));
+
+  if (isTest) {
+    // A test-file target only needs the static pass; there is no source to mutate.
+    return { ...full, testFiles: [file], sourceFiles: [], covers: new Map(), targetedFile: rel };
+  }
+
+  const tests = full.covers.get(file) ?? [];
+  return {
+    ...full,
+    sourceFiles: [file],
+    testFiles: tests,
+    covers: new Map([[file, tests]]),
+    targetedFile: rel,
+  };
+}
+
+/** Workspace globs declared by the project (npm/yarn `workspaces`, pnpm yaml). */
+async function workspacePatterns(root) {
+  const patterns = [];
+
+  try {
+    const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+    if (Array.isArray(pkg.workspaces)) patterns.push(...pkg.workspaces);
+    else if (Array.isArray(pkg.workspaces?.packages)) patterns.push(...pkg.workspaces.packages);
+  } catch { /* no package.json */ }
+
+  try {
+    const yaml = await readFile(join(root, 'pnpm-workspace.yaml'), 'utf8');
+    for (const line of yaml.split('\n')) {
+      const m = line.match(/^\s*-\s*['"]?([^'"#]+?)['"]?\s*$/);
+      if (m) patterns.push(m[1]);
+    }
+  } catch { /* no pnpm workspace */ }
+
+  return patterns;
+}
+
+/**
+ * Package directories a workspace declares.
+ *
+ * Only simple globs are expanded (`packages/*`, `apps/*`). A monorepo root almost
+ * never has the runner installed, so detecting this turns "no test runner" into an
+ * actionable list of directories.
+ */
+async function expandWorkspacePattern(root, pattern) {
+  const dirs = new Set();
+
+  if (pattern.endsWith('/*')) {
+    const parent = join(root, pattern.slice(0, -2));
+    let entries;
+    try {
+      entries = await readdir(parent, { withFileTypes: true });
+    } catch {
+      return dirs;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith('.')) dirs.add(join(parent, entry.name));
+    }
+    return dirs;
+  }
+
+  if (!/[*?]/.test(pattern)) dirs.add(join(root, pattern));
+  return dirs;
+}
+
+export async function workspaceDirs(root) {
+  const patterns = await workspacePatterns(root);
+  const found = new Set();
+  const excluded = new Set();
+
+  for (const raw of patterns) {
+    const pattern = String(raw).trim();
+    if (!pattern) continue;
+
+    const negated = pattern.startsWith('!');
+    const body = negated ? pattern.slice(1) : pattern;
+    const dirs = await expandWorkspacePattern(root, body);
+    for (const dir of dirs) {
+      if (negated) excluded.add(dir);
+      else found.add(dir);
+    }
+  }
+
+  const packages = [];
+  for (const dir of found) {
+    if (excluded.has(dir)) continue;
+    for (const marker of ['package.json', 'pyproject.toml', 'Cargo.toml']) {
+      try {
+        await stat(join(dir, marker));
+        packages.push(dir);
+        break;
+      } catch { /* not a package */ }
+    }
+  }
+
+  return packages.sort();
+}
+
 export async function discover(root) {
   const abs = resolve(root);
+
+  // A file target: audit just that file, in the project that owns it.
+  try {
+    const info = await stat(abs);
+    if (info.isFile()) return discoverFile(abs);
+  } catch { /* fall through to directory handling */ }
+
   const acc = { sourceFiles: [], testFiles: [], truncated: false };
   await walk(abs, abs, acc);
 
@@ -397,7 +556,9 @@ export async function discover(root) {
   const byKey = new Map();
   for (const src of acc.sourceFiles) byKey.set(normalisePath(abs, src), src);
 
-  for (const testFile of acc.testFiles) {
+  // Sorted, not readdir order: the covering-test list feeds the cache key and the
+  // report, so it must be the same on every run and every machine.
+  for (const testFile of [...acc.testFiles].sort()) {
     let text;
     try {
       text = await readFile(testFile, 'utf8');
@@ -464,5 +625,11 @@ export async function discover(root) {
     runner: await detectRunner(abs),
     packageManager: await detectPackageManager(abs),
     truncated: acc.truncated,
+    unsupported: acc.unsupported
+      ? [...acc.unsupported.entries()]
+        .map(([ext, count]) => ({ ext, count }))
+        .sort((a, b) => b.count - a.count)
+      : [],
+    workspaces: await workspaceDirs(abs),
   };
 }

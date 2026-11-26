@@ -86,9 +86,13 @@ export function nextStepFor(finding, context) {
 export function planFor({ findings, summary, suiteGreen, root }) {
   const certain = findings.filter((f) => f.confidence === 'certain');
   const likely = findings.filter((f) => f.confidence === 'likely');
+  const autoFixable = findings.filter((f) => AUTO_FIXABLE.has(f.id) || AUTO_FIXABLE.has(f.kind));
   const steps = [];
 
-  if (!suiteGreen) {
+  // `false` means the suite ran and is red. `null` means it was never run
+  // (static-only). Telling an agent to "fix the failing suite" when nobody ran it
+  // sends it chasing a failure that does not exist.
+  if (suiteGreen === false) {
     steps.push({
       order: 1,
       action: 'fix the failing suite first',
@@ -97,12 +101,12 @@ export function planFor({ findings, summary, suiteGreen, root }) {
     return { steps, doNotClaim: ['that the suite is healthy', 'any mutation score'] };
   }
 
-  if (certain.length > 0) {
+  if (autoFixable.length > 0) {
     steps.push({
       order: steps.length + 1,
       action: 'run_command',
       command: `npx @hsaohuang/crucible fix ${JSON.stringify(root)}`,
-      why: `${likely.length + certain.length} findings may be auto-fixable; run it before editing by hand`,
+      why: `${autoFixable.length} missing boundary test${autoFixable.length === 1 ? '' : 's'} can be written automatically; run it before editing by hand`,
     });
   }
 
@@ -129,11 +133,13 @@ export function planFor({ findings, summary, suiteGreen, root }) {
     why: 'the score must move; do not report success without it',
   });
 
-  return {
-    steps,
-    doNotClaim: [
-      'that the tests are real without re-running scan',
-      `that ${summary.worthChecking} suspect findings are defects — they may be intentional property tests`,
-    ],
-  };
+  const doNotClaim = [
+    'that the tests are real without re-running scan',
+    `that ${summary.worthChecking} suspect findings are defects — they may be intentional property tests`,
+  ];
+  if (suiteGreen === null) {
+    doNotClaim.push('any mutation score — no tests were executed in this run');
+  }
+
+  return { steps, doNotClaim };
 }

@@ -65,15 +65,24 @@ export function gradeFinding(finding) {
  * `toBeGreaterThan`, `toBeTruthy`, `toBeDefined` do not.
  */
 export function hasValuePinningAssertions(testSource) {
-  const re = /\.\s*(toBe|toEqual|toStrictEqual|toBeCloseTo|toMatchObject|toMatchInlineSnapshot)\s*\(/;
-  if (!re.test(testSource)) return false;
+  // A literal operand, including an object or array literal: `deepStrictEqual(x,
+  // { count: 3 })` pins just as surely as `equal(x, 3)`.
+  const literal = String.raw`(?:-?[\d.]+|'[^']*'|"[^"]*"|true|false|null|\{[^}]*\}|\[[^\]]*\])`;
 
-  // A pinning assertion must have a concrete operand, not just another variable
-  // compared loosely. `toBe(x)` where x is a variable still pins against the
-  // current implementation, which is weak but not nothing — we treat it as
-  // pinning only when the argument is a literal.
-  const literalPin = /\.\s*(toBe|toEqual|toStrictEqual|toBeCloseTo)\s*\(\s*(-?[\d.]+|'[^']*'|"[^"]*"|true|false|null)\s*[,)]/;
-  return literalPin.test(testSource);
+  const matcher = /\.\s*(toBe|toEqual|toStrictEqual|toBeCloseTo|toMatchObject|toMatchInlineSnapshot)\s*\(/;
+  const matcherLiteral = new RegExp(String.raw`\.\s*(?:toBe|toEqual|toStrictEqual|toBeCloseTo)\s*\(\s*${literal}\s*[,)]`);
+
+  // Every dialect pins values in its own spelling. Recognising only jest/vitest
+  // matchers labelled every surviving mutation in a node:test, ava or pytest
+  // project "likely" — overclaiming exactly the way this tool must not.
+  const avaLiteral = new RegExp(String.raw`\bt\s*\.\s*(?:is|not|deepEqual|like)\s*\(\s*[^,]+,\s*${literal}\s*[,)]`);
+  const nodeAssertLiteral = new RegExp(String.raw`\bassert\s*\.\s*(?:equal|strictEqual|deepEqual|deepStrictEqual|notEqual|notStrictEqual)\s*\(\s*[^,]+,\s*${literal}\s*[,)]`);
+  const pythonLiteral = /^\s*assert\s+.+?(?:==|!=|\bis\b)\s*(?:-?[\d.]+|'[^']*'|"[^"]*"|True|False|None)\s*$/m;
+
+  if (matcher.test(testSource) && matcherLiteral.test(testSource)) return true;
+  return avaLiteral.test(testSource)
+    || nodeAssertLiteral.test(testSource)
+    || pythonLiteral.test(testSource);
 }
 
 /**

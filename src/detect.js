@@ -91,6 +91,22 @@ const PATTERNS = [
     why: 'test is skipped, so it can never catch a regression',
     fix: 'fix and re-enable, or delete it',
   },
+  {
+    // pytest / unittest spell skipping as a decorator rather than a method call.
+    id: 'skipped',
+    kind: 'skipped',
+    re: /@\s*(?:pytest\s*\.\s*mark\s*\.\s*(?:skip|skipif|xfail)|unittest\s*\.\s*skip)\b/,
+    why: 'test is skipped, so it can never catch a regression',
+    fix: 'fix and re-enable, or delete it',
+  },
+  {
+    // Python's version of an empty catch: the call can throw and the test still passes.
+    id: 'empty-catch-in-test',
+    kind: 'swallow',
+    re: /except\b[^:\n]*:\s*pass\b/,
+    why: 'swallows the error, so the test passes even when the call throws',
+    fix: 'let the error fail the test, or assert on it',
+  },
 ];
 
 /**
@@ -156,6 +172,45 @@ export function testBlocks(source) {
       startLine: line,
       name: m[3],
       body: source.slice(braceIdx, end + 1),
+    });
+  }
+
+  return blocks;
+}
+
+/**
+ * Extract Python test function bodies (`def test_...`), using indentation.
+ *
+ * Without this, `crucible check` was effectively silent on pytest projects: every
+ * static block rule looked for `it(...)` or `test(...)`, which Python does not use.
+ *
+ * @returns {{ line: number, startLine: number, name: string, body: string }[]}
+ */
+export function pythonTestBlocks(source) {
+  const lines = source.split('\n');
+  const blocks = [];
+  const re = /^([ \t]*)(?:async[ \t]+)?def[ \t]+(test\w*)[ \t]*\([^)]*\)[ \t]*(?:->[^:]+)?:/;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = lines[i].match(re);
+    if (!match) continue;
+
+    const indent = match[1].length;
+    let end = i;
+
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const text = lines[j];
+      if (text.trim() === '') continue; // blank lines inside the body are fine
+      const lineIndent = text.match(/^\s*/)[0].length;
+      if (lineIndent <= indent) break;
+      end = j;
+    }
+
+    blocks.push({
+      line: i + 1,
+      startLine: i + 1,
+      name: match[2],
+      body: lines.slice(i, end + 1).join('\n'),
     });
   }
 
@@ -417,25 +472,80 @@ export function scanTestSource(source, fileLabel, options = {}) {
     }
   }
 
+  // Python test functions: the same "no assertion" question, different syntax.
+  for (const block of pythonTestBlocks(maskedSource)) {
+    const maskedBody = maskStrings(block.body);
+    const endLine = block.startLine + block.body.split('\n').length - 1;
+
+    const hasAssert = /\b(?:expect|assert\w*|should)\b/.test(maskedBody)
+      || /\bpytest\s*\.\s*raises\b/.test(maskedBody)
+      || /\bwith\s+self\s*\.\s*assertRaises\b/.test(maskedBody);
+    const hasThrow = /\braise\b/.test(maskedBody);
+    const hasTry = /\btry\s*:/.test(maskedBody);
+
+    // A decorator on the line(s) immediately above the def.
+    const above = lines.slice(Math.max(0, block.startLine - 3), block.startLine - 1).join('\n');
+    const isSkipped = /@\s*(?:pytest\s*\.\s*mark\s*\.\s*(?:skip|skipif|xfail)|unittest\s*\.\s*skip)\b/.test(above);
+
+    // `except ValueError:` on one line and `pass` on the next is invisible to the
+    // line scanner, so detect the swallowing pair inside the whole body.
+    const swallow = maskedBody.match(/except\b[^:\n]*:\s*pass\b/);
+    if (swallow) {
+      findings.push({
+        id: 'empty-catch-in-test',
+        file: fileLabel,
+        line: block.startLine + block.body.slice(0, swallow.index).split('\n').length - 1,
+        kind: 'swallow',
+        snippet: 'except ...: pass',
+        why: 'swallows the error, so the test passes even when the call raises',
+        fix: 'let the error fail the test, or assert on it',
+      });
+    }
+
+    const alreadyReported = findings.some(
+      (f) => f.line >= block.startLine && f.line <= endLine,
+    );
+
+    if (hasAssert || hasThrow || hasTry || isSkipped || alreadyReported) continue;
+
+    const statements = block.body.split('\n').slice(1)
+      .filter((text) => text.trim() && !/^\s*#/.test(text)).length;
+
+    findings.push({
+      id: 'no-assertion',
+      file: fileLabel,
+      line: block.startLine,
+      kind: 'empty',
+      snippet: `def ${block.name}()`,
+      why: statements > 1
+        ? 'test runs several statements but asserts nothing; it only fails if the code raises'
+        : 'test calls code once and asserts nothing, so it passes even if the result is wrong',
+      fix: 'assert on the result, or delete the test',
+      thin: statements > 1,
+    });
+  }
+
   // Mocking the thing under test makes the test self-fulfilling.
   //
   // This needs the real text, because the module paths are inside quotes and the
   // masked copy has them blanked. We check that the mocked path and the imported
   // path are the same string, which is what makes the test assert its own mock.
-  const mockCall = /vi\.mock\s*\(\s*['"]([^'"]+)['"]/g;
+  const mockCall = /(vi|jest)\s*\.\s*mock\s*\(\s*['"]([^'"]+)['"]/g;
   let mockMatch;
   while ((mockMatch = mockCall.exec(source)) !== null) {
-    const mockedPath = mockMatch[1];
-    const tail = source.slice(mockMatch.index, mockMatch.index + 600);
+    const flavour = mockMatch[1];
+    const mockedPath = mockMatch[2];
+    // Look across the whole file: the usual order is imports first, then the mock
+    // call, and a later-only window missed exactly that layout.
     const importRe = new RegExp(`import\\s[^;]*from\\s*['"]${mockedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`);
 
-    if (importRe.test(tail)) {
+    if (importRe.test(source)) {
       findings.push({
         id: 'mock-self',
         file: fileLabel,
         line: source.slice(0, mockMatch.index).split('\n').length,
         kind: 'self-fulfilling',
-        snippet: `vi.mock('${mockedPath}') on the module the test imports`,
+        snippet: `${flavour}.mock('${mockedPath}') on the module the test imports`,
         why: 'the test replaces the module it is testing, so it asserts the mock, not the code',
         fix: 'mock collaborators, not the unit under test',
       });
@@ -443,7 +553,16 @@ export function scanTestSource(source, fileLabel, options = {}) {
     }
   }
 
-  return findings.filter((f) => !ignore.ids.has(f.id));
+  // The line scanner and the block scanner can see the same construct — a one-line
+  // `except ValueError: pass` hits both. One location is one finding, otherwise
+  // `check` counts (and prints) it twice.
+  const unique = new Map();
+  for (const f of findings) {
+    if (ignore.ids.has(f.id)) continue;
+    const key = `${f.id}:${f.line}`;
+    if (!unique.has(key)) unique.set(key, f);
+  }
+  return [...unique.values()];
 }
 
 /**

@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22, 24]
+    runs-on: ${{ matrix.os }}
+    # Windows is included so it can be seen, but the tool has not been validated
+    # there and the suite makes POSIX assumptions (symlinks, shell). Treat a red
+    # Windows job as information, not a blocker.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No dependencies are needed to run the suite; npm install only validates the
+      # package manifest. `npm ci` would need a lockfile this project does not have.
+      - run: npm install --no-audit --no-fund
+
+      - name: unit and end-to-end tests
+        run: npm test
+
+      - name: the CLI starts and reports its environment
+        run: node bin/crucible.js --version

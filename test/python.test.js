@@ -7,6 +7,7 @@ import { discover } from '../src/discover.js';
 import { baseline, auditFile } from '../src/judge.js';
 import { mapComparisonsToFunctions, pythonFunctionSpan } from '../src/fix-boundary.js';
 import { fixBoundaries } from '../src/fix-boundary.js';
+import { buildPythonBoundaryTest, pyLiteral } from '../src/python.js';
 
 /**
  * Python support. Before this, `scan` worked and `fix` silently did nothing:
@@ -145,4 +146,29 @@ test('the python probe is not named like a test file', async (t) => {
   // missing test functions.
   const base = await baseline({ root: p.root, command: p.runner.command });
   assert.equal(base.green, true, 'no probe file may be left behind for pytest to collect');
+});
+
+test('python literals are rendered in python, not JSON', () => {
+  assert.equal(pyLiteral(true), 'True');
+  assert.equal(pyLiteral(false), 'False');
+  assert.equal(pyLiteral(null), 'None');
+  assert.equal(pyLiteral({ ok: true, count: null }), '{"ok": True, "count": None}');
+  assert.equal(pyLiteral([1, false]), '[1, False]');
+  assert.equal(pyLiteral(Number.NaN), null, 'a value Python cannot express must be skipped');
+
+  const body = buildPythonBoundaryTest({
+    importPath: 'src.limits',
+    sourceName: 'limits',
+    cases: [{
+      fn: 'state',
+      op: '>=',
+      constantName: 'limits.MAX',
+      values: { below: 4, at: 5, above: 6 },
+      observed: [{ ok: true }, { ok: false }, [1, 2]],
+    }],
+  });
+
+  assert.match(body, /def test_state_at_limits_max_boundary\(\)/, 'the dotted constant must not break the def name');
+  assert.match(body, /assert state\(4\) == \{"ok": True\}/);
+  assert.doesNotMatch(body, /\btrue\b|\bnull\b/, 'JSON spellings would be NameErrors in Python');
 });

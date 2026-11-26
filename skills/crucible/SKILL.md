@@ -26,14 +26,22 @@ which is correct.
 ## How to run it
 
 ```bash
-npx @hsaohuang/crucible check <dir>   # fast: which tests cannot fail
-npx @hsaohuang/crucible scan <dir> --json   # slow: untested boundaries
-npx @hsaohuang/crucible fix <dir>     # write the missing tests
+npx @hsaohuang/crucible check <path>        # fast: which tests cannot fail
+npx @hsaohuang/crucible scan <path> --json  # slow: untested boundaries
+npx @hsaohuang/crucible fix <path>          # write the missing tests
 ```
+
+`<path>` is a directory or a single file; point it at the file you just touched
+when that is the whole change (`crucible scan src/cart.js`).
 
 `scan` runs the project's tests once per mutation. On a real project that is
 **seconds to minutes**, not instant. Tell the user you are running it before you
-start, and use `--limit=N` (default 12) to keep it bounded.
+start, and use `--limit=N` (default 12) to keep it bounded. Results are cached by
+file content, so a second run over unchanged files is fast; `--jobs=N` runs
+mutations in parallel sandbox copies.
+
+`scan` exits 1 when something certainly cannot fail and 2 when it could not run at
+all (no runner, red suite). `--fail-under=N` adds a mutation-score gate for CI.
 
 Read the JSON, not the human output, when you need to act on it:
 

@@ -11,12 +11,94 @@
  */
 
 import { exec } from 'node:child_process';
-import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { randomBytes } from 'node:crypto';
+import { readFile, writeFile } from 'node:fs/promises';
+import { rmSync, writeFileSync } from 'node:fs';
 import { mutationsFor, applyMutation } from './mutate.js';
 import { relPosix, baseName } from './paths.js';
+
+/**
+ * Files whose original bytes are currently overwritten on disk, and temporary
+ * sandboxes that still need removing.
+ *
+ * The `finally` block in judgeMutation restores a file on every normal and error
+ * path, but a SIGINT (the thing a user presses when an audit is slow) terminates
+ * the process without running it. For a tool that rewrites source in place, that
+ * leaves the user's file mutated — the worst failure mode this program has.
+ *
+ * These registries exist so the CLI can restore and clean up from a signal
+ * handler before exiting.
+ */
+const inFlight = new Map();
+const sandboxes = new Set();
+const tempFiles = new Set();
+
+export function trackInFlight(file, original) {
+  inFlight.set(file, original);
+}
+
+export function clearInFlight(file) {
+  inFlight.delete(file);
+}
+
+export function registerSandbox(dir) {
+  sandboxes.add(dir);
+}
+
+export function unregisterSandbox(dir) {
+  sandboxes.delete(dir);
+}
+
+/** Temporary probe files written into the user's tree; removed on every exit path. */
+export function registerTempFile(path) {
+  tempFiles.add(path);
+}
+
+export function unregisterTempFile(path) {
+  tempFiles.delete(path);
+}
+
+export function cleanupTempFilesSync() {
+  let removed = 0;
+  for (const path of tempFiles) {
+    try {
+      rmSync(path, { force: true });
+      removed += 1;
+    } catch { /* best effort */ }
+  }
+  tempFiles.clear();
+  return removed;
+}
+
+/**
+ * Restore every file currently mutated, synchronously.
+ *
+ * Synchronous on purpose: signal handlers and the `exit` event cannot await an
+ * async write. Returns how many files were restored, for the caller's message.
+ */
+export function restoreInFlightSync() {
+  let restored = 0;
+  for (const [file, original] of inFlight) {
+    try {
+      writeFileSync(file, original, 'utf8');
+      restored += 1;
+    } catch { /* best effort — the original is also in the caller's memory */ }
+  }
+  inFlight.clear();
+  return restored;
+}
+
+/** Remove every temporary sandbox, synchronously. */
+export function cleanupSandboxesSync() {
+  let removed = 0;
+  for (const dir of sandboxes) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      removed += 1;
+    } catch { /* best effort */ }
+  }
+  sandboxes.clear();
+  return removed;
+}
 
 /** Run a shell command in a directory, capturing output. Never throws. */
 export function run(command, cwd, timeoutMs = 120_000) {
@@ -86,10 +168,70 @@ export function narrowCommand({ command, testFiles, root }) {
   if (/node_modules\/\.bin\/ava|\bava\b/.test(command)) {
     return addFailFast(`./node_modules/.bin/ava ${quoted}`);
   }
-  if (command.includes('node --test')) return `node --test ${quoted}`;
+  // `node --test` with a loader or import hook (`--import tsx`) only understands
+  // the project's files with that flag, so the narrowed command must keep its
+  // flags. The command's own positional test paths/globs are replaced by the
+  // covering files, never appended to them.
+  const nodeTest = command.match(/^(.*?\bnode)\s+(.*?)--test\b(.*)$/);
+  if (nodeTest) {
+    const prefix = `${nodeTest[1]} ${nodeTest[2]}`.trim();
+    const tailTokens = nodeTest[3].trim() ? nodeTest[3].trim().split(/\s+/) : [];
 
-  // pytest, go, cargo, swift, xcodebuild: keep the full command. Narrowing those
-  // safely is runner-specific and getting it wrong produces false survivors.
+    // Flags that take a separate value: keep the value with its flag.
+    const valueFlags = new Set([
+      '--test-reporter', '--test-reporter-destination', '--test-concurrency',
+      '--test-name-pattern', '--test-skip-pattern', '--test-timeout',
+      '--import', '--loader', '--experimental-loader', '--conditions',
+      '--require', '--env-file',
+    ]);
+    const kept = [];
+    for (let i = 0; i < tailTokens.length; i += 1) {
+      const token = tailTokens[i];
+      if (!token.startsWith('-')) continue; // a test path/glob: replaced
+      kept.push(token);
+      if (valueFlags.has(token) && i + 1 < tailTokens.length && !tailTokens[i + 1].startsWith('-')) {
+        kept.push(tailTokens[i + 1]);
+        i += 1;
+      }
+    }
+
+    return `${prefix} --test${kept.length > 0 ? ` ${kept.join(' ')}` : ''} ${quoted}`;
+  }
+
+  // pytest accepts test file paths directly; narrowing this way is the same
+  // contract as vitest's and turns a full-suite-per-mutation audit on a large
+  // Python project into a handful of files.
+  if (/python3? -m pytest|(^|\s)pytest\b/.test(command)) {
+    return addFailFast(`${command} ${quoted}`);
+  }
+
+  // Go: a mutation in a package can only be noticed by that package's tests, so
+  // narrow to the directories containing the covering `_test.go` files.
+  if (/\bgo test\b/.test(command)) {
+    const dirs = [...new Set(rels.map((rel) => {
+      const cut = rel.lastIndexOf('/');
+      return cut === -1 ? '.' : rel.slice(0, cut);
+    }))];
+    if (dirs.length <= 40) {
+      const targets = dirs.map((dir) => JSON.stringify(dir === '.' ? '.' : `./${dir}`)).join(' ');
+      return `go test -failfast ${targets}`;
+    }
+    return base;
+  }
+
+  // Cargo: only integration test targets in tests/ can be named; unit tests inside
+  // src/ belong to the crate target and cannot be selected this way.
+  if (/\bcargo test\b/.test(command)) {
+    const inTests = rels.filter((rel) => rel.startsWith('tests/'));
+    const targets = [...new Set(inTests.map((rel) => rel.slice('tests/'.length).replace(/\.[^.]+$/, '')))];
+    if (targets.length > 0 && targets.length === rels.length && targets.length <= 20) {
+      return targets.map((name) => `cargo test --test ${JSON.stringify(name)}`).join(' && ');
+    }
+    return base;
+  }
+
+  // swift, xcodebuild and anything unrecognised: keep the full command. A guessed
+  // filter that matches nothing returns green and reports every mutant as survived.
   return base;
 }
 
@@ -143,9 +285,13 @@ export function addFailFast(command) {
 export async function judgeMutation({ root, file, command, mutation, timeoutMs = 120_000 }) {
   const original = await readFile(file, 'utf8');
 
+  // Register the original BEFORE the write: a signal between the two would
+  // otherwise leave the mutated bytes on disk with nothing recorded to restore.
+  trackInFlight(file, original);
   try {
     await writeFile(file, applyMutation(original, mutation), 'utf8');
   } catch (error) {
+    clearInFlight(file);
     // A read-only file, a file owned by another user, a full disk. Writing is the
     // one operation this tool cannot fake, and crashing with a stack trace tells
     // the user nothing.
@@ -172,6 +318,7 @@ export async function judgeMutation({ root, file, command, mutation, timeoutMs =
     // Restore even when the run threw. A crashed run must never leave the user's
     // working tree modified.
     await writeFile(file, original, 'utf8').catch(() => {});
+    clearInFlight(file);
   }
 }
 

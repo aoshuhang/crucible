@@ -22,7 +22,7 @@ test('fixes a boundary on an object field and raises the score', async (t) => {
   await cp(FIXTURE, dir, { recursive: true });
   t.after(() => rm(dir, { recursive: true, force: true }));
 
-  await rmFile(join(dir, 'test/limit.exact.test.js'), { force: true });
+  await rmFile(join(dir, 'test/limit.canEnter.exact.test.js'), { force: true });
 
   const project = await discover(dir);
   const [sourceFile, testFiles] = [...project.covers.entries()].find(([, tests]) => tests.length > 0);
@@ -69,7 +69,7 @@ test('the generated test spreads the object the tests already build', async (t) 
   await cp(FIXTURE, dir, { recursive: true });
   t.after(() => rm(dir, { recursive: true, force: true }));
 
-  await rmFile(join(dir, 'test/limit.exact.test.js'), { force: true });
+  await rmFile(join(dir, 'test/limit.canEnter.exact.test.js'), { force: true });
 
   const project = await discover(dir);
   const [sourceFile, testFiles] = [...project.covers.entries()].find(([, tests]) => tests.length > 0);
@@ -100,7 +100,7 @@ test('refuses when all three boundary points return the same value', async (t) =
 
   // A comparison that feeds an intermediate variable: the boundary is invisible at
   // the call site, so a generated test would pin three identical values.
-  await rmFile(join(dir, 'test/limit.exact.test.js'), { force: true });
+  await rmFile(join(dir, 'test/limit.canEnter.exact.test.js'), { force: true });
   const { writeFile } = await import('node:fs/promises');
   await writeFile(join(dir, 'src/gate.js'), `
 export function gate(p) {
@@ -133,4 +133,41 @@ it('runs', () => { gate(base); });
   assert.equal(result.written, null, 'must not write a test that cannot fail');
   assert.ok(/feeds other logic|could not resolve|no test object/.test(result.reason),
     `expected an honest refusal, got: ${result.reason}`);
+});
+
+test('two object boundaries in one module write two distinct files', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-obj4-'));
+  await cp(FIXTURE, dir, { recursive: true });
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const project = await discover(dir);
+  const [sourceFile, testFiles] = [...project.covers.entries()].find(([, tests]) => tests.length > 0);
+  const source = await readFile(sourceFile, 'utf8');
+
+  const first = await fixObjectBoundary({
+    root: project.root,
+    sourceFile,
+    testFiles,
+    fn: 'isOverLimit',
+    comparison: { line: 4, op: '>', left: 'state.count', right: 'MAX_ITEMS' },
+    source,
+    runner: project.runner.name,
+  });
+  const second = await fixObjectBoundary({
+    root: project.root,
+    sourceFile,
+    testFiles,
+    fn: 'canEnter',
+    comparison: { line: 8, op: '>=', left: 'actor.level', right: '5' },
+    source,
+    runner: project.runner.name,
+  });
+
+  assert.ok(first.written, `expected the first fix, got: ${first.reason}`);
+  assert.ok(second.written, `expected the second fix, got: ${second.reason}`);
+  assert.notEqual(first.written, second.written, 'each function needs its own file');
+
+  // The first fix must still be on disk: the second write cannot have clobbered it.
+  const kept = await readFile(first.written, 'utf8');
+  assert.match(kept, /isOverLimit/);
 });

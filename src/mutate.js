@@ -162,6 +162,58 @@ function findOperators(masked) {
   return found;
 }
 
+/** End of an expression that starts at `start`: a `;` or an unmatched closer. */
+function expressionEnd(masked, start) {
+  let depth = 0;
+  for (let i = start; i < masked.length; i += 1) {
+    const ch = masked[i];
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      if (depth === 0) return i;
+      depth -= 1;
+    } else if ((ch === ';' || ch === ',') && depth === 0) {
+      // A comma ends the expression inside an array, argument list or object
+      // literal. Without this, `[a ? b : c, d]` swapped in the whole `c, d`.
+      return i;
+    }
+  }
+  return masked.length;
+}
+
+/**
+ * Locate a single-line ternary: `cond ? then : otherwise`.
+ *
+ * Optional chaining (`?.`) and nullish coalescing (`??`) look similar and are not
+ * ternaries. A nested ternary is skipped rather than half-rewritten.
+ */
+function findTernary(masked) {
+  for (let i = 0; i < masked.length; i += 1) {
+    if (masked[i] !== '?') continue;
+    if (masked[i + 1] === '?' || masked[i + 1] === '.') {
+      i += 1;
+      continue;
+    }
+
+    let depth = 0;
+    let colon = -1;
+    for (let j = i + 1; j < masked.length; j += 1) {
+      const ch = masked[j];
+      if (ch === '(' || ch === '[' || ch === '{') depth += 1;
+      else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
+      else if (ch === ':' && depth === 0) {
+        colon = j;
+        break;
+      } else if (ch === '?' && depth === 0) {
+        return null; // nested ternary: not worth a half-correct rewrite
+      }
+    }
+
+    if (colon === -1) return null;
+    return { question: i, colon, end: expressionEnd(masked, colon + 1) };
+  }
+  return null;
+}
+
 /**
  * Yield candidate mutations for one file's source text.
  *
@@ -219,6 +271,18 @@ export function mutationsFor(source, fileLabel = 'source', options = {}) {
       push(op.kind, start, end, op.to, op.label);
     }
 
+    // 1b. Ternary branch swap: `cond ? a : b` -> `cond ? b : a`.
+    //     Catches a conditional nobody checks in both directions.
+    const ternary = findTernary(masked);
+    if (ternary) {
+      const thenPart = raw.slice(ternary.question + 1, ternary.colon).trim();
+      const elsePart = raw.slice(ternary.colon + 1, ternary.end).trim();
+      if (thenPart && elsePart && thenPart !== elsePart) {
+        push('condition', ternary.question, ternary.end,
+          `? ${elsePart} : ${thenPart}`, 'swap the ternary branches');
+      }
+    }
+
     // 2. Numeric literals. Under the logic profile a bare constant declaration is
     //    skipped, because pinning every tuning number is not a quality signal.
     if (!(declarationOnly && !strict)) {
@@ -258,6 +322,13 @@ export function mutationsFor(source, fileLabel = 'source', options = {}) {
       if (close !== -1) {
         push('condition', open, close, `!(${raw.slice(open, close)})`,
           'negate the condition');
+
+        // A second, stronger mutant: force the branch true. Negation can be an
+        // equivalent mutant when the body is symmetric; forcing true cannot.
+        const condition = raw.slice(open, close).trim();
+        if (condition && condition !== 'true') {
+          push('condition', open, close, 'true', 'force the condition true');
+        }
       }
     }
 

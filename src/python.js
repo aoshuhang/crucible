@@ -21,6 +21,45 @@
  * @param {string} opts.sourceName
  * @param {{ fn: string, op: string, constantName: string, values: {at:number,below:number,above:number}, observed: any[] }[]} opts.cases
  */
+/** A name safe to put in a Python identifier (functional test name). */
+function identifierPart(text) {
+  const slug = String(text).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return slug || 'threshold';
+}
+
+/**
+ * Render a value as a Python literal.
+ *
+ * `JSON.stringify` is not a Python renderer: `true`, `false` and `null` are
+ * NameErrors, and a generated test that errors is worse than no test. Returns
+ * null when the value cannot be represented, so the caller skips that assertion.
+ */
+export function pyLiteral(value, depth = 0) {
+  if (depth > 4) return null;
+  if (value === null) return 'None';
+  if (typeof value === 'boolean') return value ? 'True' : 'False';
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : null;
+  if (typeof value === 'string') return JSON.stringify(value);
+
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => pyLiteral(item, depth + 1));
+    if (parts.some((part) => part === null)) return null;
+    return `[${parts.join(', ')}]`;
+  }
+
+  if (typeof value === 'object') {
+    const parts = [];
+    for (const [key, item] of Object.entries(value)) {
+      const rendered = pyLiteral(item, depth + 1);
+      if (rendered === null) return null;
+      parts.push(`${JSON.stringify(key)}: ${rendered}`);
+    }
+    return `{${parts.join(', ')}}`;
+  }
+
+  return null;
+}
+
 export function buildPythonBoundaryTest({ importPath, sourceName, cases }) {
   const lines = [];
 
@@ -39,7 +78,9 @@ export function buildPythonBoundaryTest({ importPath, sourceName, cases }) {
 
   for (const c of cases) {
     lines.push('');
-    lines.push(`def test_${c.fn}_at_${String(c.constantName).toLowerCase()}_boundary():`);
+    // `constantName` can be dotted (`limits.MAX`); a dot in a def name is a
+    // SyntaxError, so the test name is slugged.
+    lines.push(`def test_${c.fn}_at_${identifierPart(c.constantName)}_boundary():`);
 
     const labels = ['one below', 'exactly at', 'one above'];
     for (let i = 0; i < 3; i += 1) {
@@ -47,19 +88,14 @@ export function buildPythonBoundaryTest({ importPath, sourceName, cases }) {
       if (v === undefined) continue;
 
       const input = [c.values.below, c.values.at, c.values.above][i];
-      lines.push(`    # ${labels[i]} the threshold (${input})`);
+      const literal = pyLiteral(v);
+      if (literal === null) continue; // not representable in Python; do not lie
 
+      lines.push(`    # ${labels[i]} the threshold (${input})`);
       if (typeof v === 'number') {
         lines.push(`    assert abs(${c.fn}(${input}) - ${v}) < 1e-6`);
-      } else if (typeof v === 'string') {
-        lines.push(`    assert ${c.fn}(${input}) == ${JSON.stringify(v)}`);
-      } else if (typeof v === 'boolean') {
-        lines.push(`    assert ${c.fn}(${input}) is ${v ? 'True' : 'False'}`);
-      } else if (v === null) {
-        lines.push(`    assert ${c.fn}(${input}) is None`);
       } else {
-        // Objects and lists: compare the whole value.
-        lines.push(`    assert ${c.fn}(${input}) == ${JSON.stringify(v)}`);
+        lines.push(`    assert ${c.fn}(${input}) == ${literal}`);
       }
     }
 

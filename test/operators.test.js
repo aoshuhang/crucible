@@ -189,6 +189,19 @@ test('narrows a node --test command', () => {
   assert.match(cmd, /test\/one\.test\.js/);
 });
 
+test('node --test narrowing keeps loader flags and drops the old globs', () => {
+  const cmd = narrowCommand({
+    command: 'node --import tsx --test --test-concurrency=1 test/*.test.ts',
+    testFiles: ['/r/test/one.test.ts'],
+    root: '/r',
+  });
+
+  assert.match(cmd, /--import tsx/, 'a TS project only runs under its loader');
+  assert.match(cmd, /--test-concurrency=1/);
+  assert.match(cmd, /test\/one\.test\.ts/);
+  assert.doesNotMatch(cmd, /\*\.test\.ts/, 'the old glob must be replaced, not appended');
+});
+
 test('keeps the full command when there is no test list', () => {
   const full = 'node --test';
   assert.equal(narrowCommand({ command: full, testFiles: [], root: '/r' }), full);

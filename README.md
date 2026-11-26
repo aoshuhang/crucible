@@ -1,9 +1,10 @@
 # crucible
 
-> **Status: 0.1.0, early.** Built and tested against six real projects on macOS.
+> **Status: 0.2.0, early.** Built and tested against six real projects on macOS.
 > When it cannot determine something it refuses and says why, rather than guessing —
 > that is the main design goal, because a wrong test-quality score is worse than no
-> score. Expect rough edges anyway. Windows is untested (see [Platforms](#platforms)).
+> score. Expect rough edges anyway. Windows is exercised in CI but still
+> experimental (see [Platforms](#platforms)). See [CHANGELOG.md](CHANGELOG.md).
 > Counter-examples and bug reports are genuinely useful.
 
 **Find the tests that cannot fail. Then fix them.**
@@ -217,11 +218,15 @@ never counted as a fake test.
 
 | command | speed | what it does |
 |---|---|---|
-| `crucible check [dir]` | **0.1s** | reads the test files, finds the ones that cannot fail. No tests are executed. |
-| `crucible scan [dir]` | seconds–minutes | mutates the source, finds boundaries no test covers |
-| `crucible fix [dir]` | seconds | writes the boundary tests that were missing |
-| `crucible verify [dir]` | seconds–minutes | re-runs `scan` after a fix, to see the score move |
+| `crucible check [path]` | **0.1s** | reads the test files, finds the ones that cannot fail. No tests are executed. |
+| `crucible scan [path]` | seconds–minutes | mutates the source, finds boundaries no test covers |
+| `crucible fix [path]` | seconds | writes the boundary tests that were missing |
+| `crucible verify [path]` | seconds–minutes | re-runs `scan` after a fix, to see the score move |
 | `crucible install` | instant | copies the agent skill into OpenCode and Claude Code |
+
+`[path]` is a directory or a single file. `crucible scan src/cart.js` audits only
+that file, in the project that owns it. On a second run over unchanged files the
+incremental cache makes `scan` near-instant.
 
 `check` is the one you run while writing tests. `scan` is the one you run before a
 PR. `fix` is what you run when `scan` finds something.
@@ -232,6 +237,9 @@ PR. `fix` is what you run when `scan` finds something.
 |---|---|---|
 | `--json` | all | machine-readable output, including a `next` block per finding |
 | `--limit=N` | scan, fix | audit at most N source files (default 12) |
+| `--jobs=N` | scan | parallel sandbox workers (default `min(4, cpus)`; `1` mutates in place) |
+| `--no-cache` | scan | ignore the incremental results cache |
+| `--fail-under=N` | scan | exit 1 when the mutation score is below N percent |
 | `--verbose` | scan | print each mutation as it runs |
 | `--no-mutation` | scan | static checks only, no test runs |
 | `--profile=logic\|strict` | scan | skip tuning constants (default) or mutate everything |
@@ -241,8 +249,9 @@ PR. `fix` is what you run when `scan` finds something.
 
 ### Exit codes
 
-`check` and `scan` exit 1 when something is certainly wrong, 0 otherwise. That is
-all a pre-commit hook or a CI step needs:
+`check` and `scan` exit 1 when something is certainly wrong — including a mutation
+score below `--fail-under` — and 2 when the audit could not run at all (no runner,
+red suite). That is all a pre-commit hook or a CI step needs:
 
 ```bash
 # .git/hooks/pre-commit
@@ -265,13 +274,25 @@ Detected automatically, no configuration:
 - **cargo test**
 - **swift test**
 
-`scan` works on all of them. `fix` writes JS/TS and pytest code; the others are
-detected and mutated but their repair still needs a hand-written test.
+`scan` works on all of them, and narrows the test command to the covering files
+for vitest, jest, ava, `node --test`, pytest, Go and Cargo. `fix` writes JS/TS
+(including TypeScript boundary tests, which run through the project's own runner)
+and pytest code; the others are detected and mutated but their repair still needs
+a hand-written test. `check` analyses JavaScript/TypeScript test bodies and Python
+`def test_*` functions.
 
 Source files are matched to tests by resolving imports, by Go's `foo_test.go`
 sibling convention, and — as a fallback — by basename reference. A file with no
 covering test is reported as *untested*, which is a different problem and is not
 counted as a fake test.
+
+**Monorepos.** A workspace root usually declares packages but does not have the
+runner installed itself. `scan` detects npm/yarn workspaces and
+`pnpm-workspace.yaml`, and prints the package directories to run against instead of
+blaming the runner. Run `crucible scan packages/web` per package for full coverage.
+
+**Formats it cannot parse.** `.vue`, `.svelte`, `.astro`, Ruby, PHP and similar
+files are counted and reported as skipped. They are not silently treated as clean.
 
 If the test command cannot be determined from `package.json` or a known config
 file, crucible refuses rather than guessing a glob. A guessed glob matches nothing,
@@ -391,15 +412,27 @@ lines whose right-hand side is a single literal.
 
 ## Speed
 
-Mutations rewrite source, so files run sequentially. Two things keep it usable:
+Four things keep it usable:
 
 - **Only covering tests run.** If a source file has 2 covering test files, the
-  command is narrowed to those instead of the whole suite.
+  command is narrowed to those instead of the whole suite. This works for
+  vitest, jest, ava, `node --test`, pytest, Go and Cargo.
 - **Sampling covers the whole file.** 12 mutations are chosen by line bucket, not
   by taking the first 12 matches, so a well-tested first half cannot hide a bare
   second half.
+- **Parallel sandboxes.** With `--jobs=N` (default `min(4, cpus)`) crucible copies
+  the project into temporary sandboxes and mutates them independently. Each copy
+  must run the suite green once before any result from it is trusted; otherwise the
+  audit falls back to mutating in place, sequentially. `--jobs=1` forces that path.
+- **Incremental cache.** Results are keyed by the source bytes, the covering-test
+  bytes, the command, the profile and the mutation cap, so re-auditing unchanged
+  files is near-instant. The cache lives in `node_modules/.cache/crucible` (or the
+  OS temp directory when there is no `node_modules`) and never in the repo root.
+  `--no-cache` ignores it.
 
-A 9-file audit of a 5k-line TypeScript game prototype takes 70 seconds.
+A 9-file audit of a 5k-line TypeScript game prototype took 70 seconds sequentially;
+the sandbox path scales with cores, and a second run over unchanged files does no
+mutation work at all.
 
 ## What it cannot fix, and says so
 
@@ -430,8 +463,8 @@ expression.
 | platform | state |
 |---|---|
 | macOS | developed and tested here |
-| Linux | expected to work; the shell commands and path handling are portable |
-| Windows | **untested.** Path handling and shell quoting were written to be portable, but nobody has run it. If you do, an issue either way is useful. |
+| Linux | tested in CI on Node 20, 22 and 24 |
+| Windows | **experimental.** CI runs the suite and reports it without gating. Shell quoting and sandbox symlinks are the likely rough edges; an issue either way is useful. |
 
 Node 20 or newer. No other requirements.
 
@@ -457,13 +490,20 @@ valuable bug you can file. Include the test file and the command output.
 - **Equivalent mutants exist.** Bumping a config constant that no test should pin
   produces a survivor that is not a defect. The tool filters loops, bitwise tricks
   and shifts, but it cannot prove equivalence in general.
-- **One file at a time.** Mutations rewrite source, so runs are sequential. A large
-  repo is slow; use `--limit` to audit the files you care about.
+- **Parallelism needs a copyable project.** Sandbox mode copies the tree (excluding
+  `node_modules` and `.git`) and links dependencies. A project whose tests depend on
+  `.git`, absolute paths, or writing into the repo may behave differently in a
+  sandbox; crucible falls back to the in-place sequential path when a copy cannot be
+  validated. A large repo is still slow; use `--limit` to audit the files you care
+  about.
 - **Xcode projects are detected but impractically slow.** One `xcodebuild test`
   cycle measured 5m37s, so a 12-mutation audit takes over an hour. Use it on a
   single file at most, or not at all.
 - **No discoverable test script means refusal, not a guess.** A wrong score is worse
   than no score.
+- **CommonJS modules are scanned but not auto-fixed.** `fix` recognises ESM and
+  Python exports; a file that only assigns `module.exports` is audited normally but
+  gets no generated test. Write that one by hand, or convert it to ESM.
 
 ## When the suite fails for a reason that is not your code
 
