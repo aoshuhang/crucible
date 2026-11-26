@@ -138,9 +138,9 @@ assistant writes tests:
 
 | project | stars | mutation score | false positives |
 |---|---|---|---|
-| **chalk** | 23k | **92%** | 0 |
-| **slugify** | 2.7k | **100%** | 0 |
-| AI-written sample | — | **25%** | 4 findings |
+| **chalk** | 23k | **92%** (94% full) | 0 |
+| **slugify** | 2.7k | **91%** | 0 |
+| AI-written sample | — | **42%** (44% full) | 4 findings |
 
 The two mature projects score high because their tests are good — and `crucible`
 says nothing about them. The AI-written sample is the control: six green tests
@@ -193,7 +193,7 @@ worse than no score.
 
 ## Status
 
-Version 0.1.0. 2,991 lines, 64 tests. Zero false positives scanning itself, chalk and slugify.
+Version 0.1.0. 3,173 lines, 76 tests. Zero false positives scanning itself, chalk and slugify.
 
 The self-scan is the honest benchmark: `crucible` run against its own suite reports `0 tests cannot fail, 0 untested edges, 0 do not check values`.
 
@@ -203,9 +203,9 @@ Repository is private for now. The mechanism works and the numbers above are rep
 
 | project | stars | score | notes |
 |---|---|---|---|
-| chalk | 23k | 100% | 0 false positives |
-| slugify | 2.7k | 100% | 0 false positives |
-| AI-written cart module | — | 58% | 4 findings, all real |
+| chalk | 23k | 92% (94% full) | 0 false positives |
+| slugify | 2.7k | 91% | 0 false positives |
+| AI-written cart module | — | 42% (44% full) | 4 findings, all real |
 | object-field sample | — | 0% → 67% | auto-fixed |
 | 5k-line game prototype | — | 52% | 17 edges reported |
 
@@ -227,3 +227,19 @@ Three upgrades, each driven by a measurement rather than a guess:
 **Even sampling and narrowed commands.** 12 mutations are chosen by line bucket so a well-tested first half cannot hide a bare second half, and only the test files covering the source are run instead of the whole suite.
 
 **One bug found by the upgrade itself.** The operator table had `>=`, `<=`, `==`, `===` but not bare `>` and `<`. Every `a > b` in every project had been silently unmutable since the first commit — the most common comparison in the language. Caught by a test asserting that a comparison inside a declaration is still mutated, which returned zero mutations. All scores before that fix were understated for files dominated by `>` and `<`.
+
+**Sampling accuracy, and the 100% that was a lie.** The first sampling strategy
+sorted mutations by operator priority. `number` mutations sort last, so they were
+dropped from the sample — and those are exactly the ones that survive most, because
+a test that pins direction never pins magnitude.
+
+The result: a file reported **67%** whose true score was **44%**. chalk reported a
+flattering **100%** where the full run says **94%**.
+
+Sampling is now proportional to operator kind, guaranteed at least one per kind,
+spread across the file by line. The same file reports 42% against 44%, and chalk
+92% against 94%. Two points instead of twenty-three.
+
+This is the second time a number this tool produced was too kind — the first was
+the runner-detection bug that reported 0%. Both were caught by cross-checking the
+sample against a full run rather than trusting the default path.

@@ -156,9 +156,9 @@ Run it on a clean working tree anyway — that is what git is for.
 
 | project | stars | mutation score | false positives |
 |---|---|---|---|
-| **chalk** | 23k | **100%** | 0 |
-| **slugify** | 2.7k | **100%** | 0 |
-| AI-written sample | — | **58%** | 4 findings |
+| **chalk** | 23k | **92%** (94% full) | 0 |
+| **slugify** | 2.7k | **91%** | 0 |
+| AI-written sample | — | **42%** (44% full) | 4 findings |
 | object-field sample | — | 0% → **67%** after fix |
 | 5k-line game prototype | — | **52%** | 17 edges |
 
