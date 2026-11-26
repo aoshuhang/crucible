@@ -9,7 +9,7 @@ import { discover } from '../src/discover.js';
  * The runner must come from the project's own test script.
  *
  * This is a regression guard for a bug that produced confidently wrong output:
- * unfake guessed `tests/*.test.js` for chalk, which actually keeps its tests in
+ * crucible guessed `tests/*.test.js` for chalk, which actually keeps its tests in
  * `test/[!_]*.js`. The guessed glob matched nothing, so zero tests ran, the suite
  * was always green, and every mutation was reported as a survivor. The tool said
  * "mutation score 0%" about a project whose tests catch the mutation.
@@ -17,7 +17,7 @@ import { discover } from '../src/discover.js';
  * A wrong score is worse than no score, so the rule is: use what the project says.
  */
 async function makeProject(pkg) {
-  const dir = await mkdtemp(join(tmpdir(), 'unfake-runner-'));
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-runner-'));
   await mkdir(join(dir, 'src'), { recursive: true });
   await writeFile(join(dir, 'package.json'), JSON.stringify(pkg, null, 2));
   await writeFile(join(dir, 'src/index.js'), 'export const a = 1;\n');

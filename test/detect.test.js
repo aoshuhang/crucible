@@ -1,5 +1,5 @@
-// unfake-ignore-file
-// This file's fixtures are deliberately broken test code; unfake scanning its own
+// crucible-ignore-file
+// This file's fixtures are deliberately broken test code; crucible scanning its own
 // samples would be a false positive.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

@@ -146,7 +146,7 @@ export async function fixBoundaries({ root, sourceFile, testFiles, runner, runne
     await writeFile(probePath, probeBody, 'utf8');
 
     // Run the probe directly with node: it must not go through the project's test
-    // runner, which would skip it when unfake itself runs inside a test process.
+    // runner, which would skip it when crucible itself runs inside a test process.
     const probeRun = await run(`node ${JSON.stringify(probePath)}`, root, 60_000);
     const probed = parseProbeOutput(probeRun.stdout + probeRun.stderr);
 

@@ -1,4 +1,4 @@
-# Release notes — unfake 0.1.0
+# Release notes — crucible 0.1.0
 
 **Find the tests that cannot fail. Then fix them.**
 
@@ -12,14 +12,14 @@ The tell is everywhere now. A function gets a test that asserts `typeof x === 'b
 
 The usual response is a linter that reads the test and guesses. That fails for the obvious reason: reading a test cannot tell you whether it would catch a regression. Only running the code can.
 
-`unfake` does the thing that actually answers the question. It **breaks your source on purpose** and checks whether the suite notices. When it doesn't, it writes the test that was missing.
+`crucible` does the thing that actually answers the question. It **breaks your source on purpose** and checks whether the suite notices. When it doesn't, it writes the test that was missing.
 
 ---
 
 ## What it does
 
 ```
-$ unfake scan
+$ crucible scan
 
   runner vitest (green in 632ms)
   29 source, 6 test files
@@ -42,7 +42,7 @@ mutation score 31% across 4 files
 Then:
 
 ```
-$ unfake fix
+$ crucible fix
   wrote tests/limits.exact.test.js (1 boundary comparison pinned)
 
 1 file(s) written, suite still green.
@@ -74,7 +74,7 @@ The first version of `fix` pinned the values the existing tests already produced
 
 To kill an off-by-one you have to call **at the boundary**: 9, 10 and 11. That is the difference between a test that documents current behaviour and a test that would fail if the behaviour changed.
 
-`unfake` reads the comparison, resolves the threshold (including `const MAX = 10`), probes the real return values at all three points, and pins them. Verified, not assumed: the suite must still be green afterwards, and `unfake verify` re-runs the audit so you see the number move.
+`crucible` reads the comparison, resolves the threshold (including `const MAX = 10`), probes the real return values at all three points, and pins them. Verified, not assumed: the suite must still be green afterwards, and `crucible verify` re-runs the audit so you see the number move.
 
 ---
 
@@ -111,7 +111,7 @@ Flags: `--json`, `--verbose`, `--no-mutation`, `--limit=N`.
 
 ## Safety
 
-`unfake` modifies source files to run each mutation and restores each one in a `finally` block. It refuses to run at all if your suite is already failing, because every result would be meaningless. It refuses to write a fix if the suite goes red afterwards.
+`crucible` modifies source files to run each mutation and restores each one in a `finally` block. It refuses to run at all if your suite is already failing, because every result would be meaningless. It refuses to write a fix if the suite goes red afterwards.
 
 Run it on a clean working tree anyway. That is what git is for.
 
@@ -121,7 +121,7 @@ Run it on a clean working tree anyway. That is what git is for.
 
 These are not caveats buried in a README. They are the boundaries of what the tool claims.
 
-**Object arguments are reported, not fixed.** `decideState(perception)` takes a shape, not a number. Feeding it `9, 10, 11` throws. `unfake` prints the exact comparison and the case you need to write, and says so instead of generating a broken test. On a real project this was 5 of 9 files.
+**Object arguments are reported, not fixed.** `decideState(perception)` takes a shape, not a number. Feeding it `9, 10, 11` throws. `crucible` prints the exact comparison and the case you need to write, and says so instead of generating a broken test. On a real project this was 5 of 9 files.
 
 **Equivalent mutants exist.** Bumping a config constant that no test should pin produces a survivor that is not a defect. The tool filters loop counters, bitwise tricks and shifts, but equivalence cannot be proven in general.
 
@@ -142,7 +142,7 @@ assistant writes tests:
 | **slugify** | 2.7k | **100%** | 0 |
 | AI-written sample | — | **25%** | 4 findings |
 
-The two mature projects score high because their tests are good — and `unfake`
+The two mature projects score high because their tests are good — and `crucible`
 says nothing about them. The AI-written sample is the control: six green tests
 covering a small cart module, and the tool finds four real problems in it.
 
@@ -161,7 +161,7 @@ it('total is defined', () => {
 });
 ```
 
-`unfake` reports the missing edge at `amount >= FREE_SHIPPING_OVER`, generates the
+`crucible` reports the missing edge at `amount >= FREE_SHIPPING_OVER`, generates the
 test at 49/50/51, and the score moves.
 
 **One honest note on methodology.** The first version of the runner detection
@@ -169,7 +169,7 @@ guessed a test glob. chalk keeps its tests in `test/[!_]*.js`, the guessed glob
 matched nothing, zero tests ran, the suite was always green, and every mutation was
 reported as a survivor — a confident `0%` about a project that actually catches the
 mutation. It was caught by manually breaking `index.js` and watching 30 tests fail
-while `unfake` still said "survived". The runner now comes from the project's own
+while `crucible` still said "survived". The runner now comes from the project's own
 test script, and there are five regression tests pinning that. A wrong score is
 worse than no score.
 
@@ -177,7 +177,7 @@ worse than no score.
 
 ## Limits, stated plainly
 
-**Boundaries on intermediate variables are reported, not fixed.** `const visible = threat.distance <= sight; if (visible && wounded) ...` cannot be probed by varying the distance: all three boundary points return the same value, because the difference only appears when other conditions also hold. `unfake` detects this, refuses to write a test that would pin three identical values, and prints the comparison for a human. On a 5k-line game prototype this was 0 of 9 files fixable — every boundary was an intermediate variable in a state machine.
+**Boundaries on intermediate variables are reported, not fixed.** `const visible = threat.distance <= sight; if (visible && wounded) ...` cannot be probed by varying the distance: all three boundary points return the same value, because the difference only appears when other conditions also hold. `crucible` detects this, refuses to write a test that would pin three identical values, and prints the comparison for a human. On a 5k-line game prototype this was 0 of 9 files fixable — every boundary was an intermediate variable in a state machine.
 
 **Equivalent mutants exist.** Bumping a config constant that no test should pin produces a survivor that is not a defect. The tool filters loop counters, bitwise tricks and shifts, but equivalence cannot be proven in general.
 
@@ -187,7 +187,7 @@ worse than no score.
 
 **JS/TS is the best-covered path.** Python, Go, Rust and Swift runners are detected and mutated, but the boundary-fixing logic has only been exercised on JS/TS.
 
-**No discoverable test script means refusal, not a guess.** If the runner cannot be determined from `package.json` or a known config, `unfake` says so and stops. Guessing produced a confidently wrong `0%` score once, which is exactly the failure mode this tool exists to prevent.
+**No discoverable test script means refusal, not a guess.** If the runner cannot be determined from `package.json` or a known config, `crucible` says so and stops. Guessing produced a confidently wrong `0%` score once, which is exactly the failure mode this tool exists to prevent.
 
 ---
 
@@ -195,7 +195,7 @@ worse than no score.
 
 Version 0.1.0. 2,991 lines, 64 tests. Zero false positives scanning itself, chalk and slugify.
 
-The self-scan is the honest benchmark: `unfake` run against its own suite reports `0 tests cannot fail, 0 untested edges, 0 do not check values`.
+The self-scan is the honest benchmark: `crucible` run against its own suite reports `0 tests cannot fail, 0 untested edges, 0 do not check values`.
 
 Repository is private for now. The mechanism works and the numbers above are reproducible.
 

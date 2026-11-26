@@ -17,7 +17,7 @@ const FIXTURE = new URL('./fixtures/project/', import.meta.url).pathname;
  * proves the tool does what the README says.
  */
 test('fix raises the mutation score on a project with a fake test', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'unfake-e2e-'));
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-e2e-'));
   await cp(FIXTURE, dir, { recursive: true });
 
   t.after(async () => { await rm(dir, { recursive: true, force: true }); });
@@ -64,7 +64,7 @@ test('fix raises the mutation score on a project with a fake test', async (t) =>
 });
 
 test('generated boundary test calls at the threshold and its neighbours', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'unfake-gen-'));
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-gen-'));
   await cp(FIXTURE, dir, { recursive: true });
   t.after(async () => { await rm(dir, { recursive: true, force: true }); });
 
@@ -91,7 +91,7 @@ test('generated boundary test calls at the threshold and its neighbours', async 
 });
 
 test('the working tree is restored after an audit', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'unfake-restore-'));
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-restore-'));
   await cp(FIXTURE, dir, { recursive: true });
   t.after(async () => { await rm(dir, { recursive: true, force: true }); });
 

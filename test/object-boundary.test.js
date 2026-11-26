@@ -18,7 +18,7 @@ const FIXTURE = new URL('./fixtures/object-args/', import.meta.url).pathname;
  * test, spreads it with `level: 5`, and pins the result.
  */
 test('fixes a boundary on an object field and raises the score', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'unfake-obj-'));
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-obj-'));
   await cp(FIXTURE, dir, { recursive: true });
   t.after(() => rm(dir, { recursive: true, force: true }));
 
@@ -65,7 +65,7 @@ test('fixes a boundary on an object field and raises the score', async (t) => {
 });
 
 test('the generated test spreads the object the tests already build', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'unfake-obj2-'));
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-obj2-'));
   await cp(FIXTURE, dir, { recursive: true });
   t.after(() => rm(dir, { recursive: true, force: true }));
 
@@ -94,7 +94,7 @@ test('the generated test spreads the object the tests already build', async (t) 
 });
 
 test('refuses when all three boundary points return the same value', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'unfake-obj3-'));
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-obj3-'));
   await cp(FIXTURE, dir, { recursive: true });
   t.after(() => rm(dir, { recursive: true, force: true }));
 

@@ -1,10 +1,10 @@
 {
-  "name": "unfake",
+  "name": "crucible",
   "version": "0.1.0",
   "description": "Find AI-generated tests that assert nothing, then rewrite them until they actually catch bugs.",
   "type": "module",
   "bin": {
-    "unfake": "./bin/unfake.js"
+    "crucible": "./bin/crucible.js"
   },
   "files": [
     "bin",
@@ -17,7 +17,7 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 'test/*.test.js'",
-    "selftest": "node bin/unfake.js scan test/fixtures/project --json"
+    "selftest": "node bin/crucible.js scan test/fixtures/project --json"
   },
   "keywords": [
     "testing",
@@ -27,5 +27,13 @@
     "claude-code",
     "opencode"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aoshuhang/crucible.git"
+  },
+  "homepage": "https://github.com/aoshuhang/crucible#readme",
+  "bugs": {
+    "url": "https://github.com/aoshuhang/crucible/issues"
+  },
   "license": "MIT"
 }

@@ -136,7 +136,7 @@ function testBlocks(source) {
  * code inside a test fixture (e.g. a linter testing itself) is not mistaken for
  * real assertions.
  *
- * This matters more than it looks: the first project anyone points unfake at might
+ * This matters more than it looks: the first project anyone points crucible at might
  * well be a tool that tests tools, and reporting its fixtures as fake tests would
  * destroy trust immediately.
  */
@@ -184,13 +184,13 @@ function maskStrings(source) {
  * A file can opt out of one or all checks with a comment, because a tool that tests
  * tools legitimately contains sample code that looks broken.
  *
- *   // unfake-ignore-file        skip this file entirely
- *   // unfake-ignore mock-self   skip one finding id
+ *   // crucible-ignore-file        skip this file entirely
+ *   // crucible-ignore mock-self   skip one finding id
  */
 export function ignoreDirectives(source) {
-  const all = /\/\/\s*unfake-ignore-file/.test(source);
+  const all = /\/\/\s*crucible-ignore-file/.test(source);
   const ids = new Set();
-  const re = /\/\/\s*unfake-ignore\s+([\w-]+)/g;
+  const re = /\/\/\s*crucible-ignore\s+([\w-]+)/g;
   let m;
   while ((m = re.exec(source)) !== null) ids.add(m[1]);
   return { all, ids };

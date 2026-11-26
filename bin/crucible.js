@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * unfake — find tests that cannot fail, then pin the values they should assert.
+ * crucible — find tests that cannot fail, then pin the values they should assert.
  *
  * Two independent signals, graded by how provable they are:
  *
@@ -9,9 +9,9 @@
  *              when the tests do pin values and we cannot prove a gap)
  *
  * Commands:
- *   unfake scan [dir]     report findings
- *   unfake fix  [dir]     write regression tests that pin real values
- *   unfake verify [dir]   re-run the audit after a fix
+ *   crucible scan [dir]     report findings
+ *   crucible fix  [dir]     write regression tests that pin real values
+ *   crucible verify [dir]   re-run the audit after a fix
  */
 
 import { readFile } from 'node:fs/promises';
@@ -129,7 +129,7 @@ async function mutationPass(project, { onProgress } = {}) {
 }
 
 async function cmdScan() {
-  say(`${C.bold}unfake${C.reset} ${C.dim}${target}${C.reset}`);
+  say(`${C.bold}crucible${C.reset} ${C.dim}${target}${C.reset}`);
 
   const project = await discover(target);
   if (!project.runner) {
@@ -245,7 +245,7 @@ async function cmdScan() {
 
   if (summary.fakeTests + summary.likelyFake > 0) {
     say('');
-    say(`Run ${C.cyan}unfake fix ${target}${C.reset} to pin the values these tests skip.`);
+    say(`Run ${C.cyan}crucible fix ${target}${C.reset} to pin the values these tests skip.`);
   }
 }
 
@@ -254,7 +254,7 @@ async function cmdScan() {
  * already trust. Verified afterwards: we report the score change, not a claim.
  */
 async function cmdFix() {
-  say(`${C.bold}unfake${C.reset} ${C.dim}fixing ${target}${C.reset}`);
+  say(`${C.bold}crucible${C.reset} ${C.dim}fixing ${target}${C.reset}`);
 
   const project = await discover(target);
   if (!project.runner) {
@@ -386,7 +386,7 @@ async function cmdFix() {
   say('');
   if (after.green) {
     say(`${C.green}${C.bold}${written.length} file(s) written, suite still green.${C.reset}`);
-    say(`Run ${C.cyan}unfake verify ${target}${C.reset} to see the new mutation score.`);
+    say(`Run ${C.cyan}crucible verify ${target}${C.reset} to see the new mutation score.`);
   } else {
     say(`${C.red}the suite went red after writing the new tests.${C.reset}`);
     say(`${C.dim}Review the generated files, or delete them and re-run.${C.reset}`);
@@ -404,9 +404,9 @@ if (!commands[command]) {
   console.error(`unknown command: ${command}
 
 usage:
-  unfake scan   [dir]   report tests that cannot fail
-  unfake fix    [dir]   write regression tests that pin real values
-  unfake verify [dir]   re-run after a fix
+  crucible scan   [dir]   report tests that cannot fail
+  crucible fix    [dir]   write regression tests that pin real values
+  crucible verify [dir]   re-run after a fix
 
 options:
   --json           machine-readable output

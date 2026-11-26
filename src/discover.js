@@ -140,7 +140,7 @@ function normalisePath(root, file) {
 /**
  * Decide how to run this project's tests.
  *
- * `npm run test` is avoided on purpose: when unfake runs inside a test process,
+ * `npm run test` is avoided on purpose: when crucible runs inside a test process,
  * node:test refuses to nest and silently skips the suite, which would make every
  * mutation look like it survived. We call the runner binary directly instead.
  */
