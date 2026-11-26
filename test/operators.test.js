@@ -194,10 +194,20 @@ test('keeps the full command when there is no test list', () => {
   assert.equal(narrowCommand({ command: full, testFiles: [], root: '/r' }), full);
 });
 
-test('keeps the full command when too many files cover the source', () => {
+test('narrows even when many files cover the source', () => {
+  // The old cap of 6 meant every file in a large project fell back to the whole
+  // suite. axios has 12-17 covering tests per source, so one file took minutes.
   const full = 'node --test';
-  const many = Array.from({ length: 9 }, (_, i) => `/r/t${i}.test.js`);
-  assert.equal(narrowCommand({ command: full, testFiles: many, root: '/r' }), full);
+  const many = Array.from({ length: 17 }, (_, i) => `/r/t${i}.test.js`);
+  const narrowed = narrowCommand({ command: full, testFiles: many, root: '/r' });
+  assert.notEqual(narrowed, full, '17 of 185 files is still a 10x reduction');
+  assert.match(narrowed, /t0\.test\.js/);
+});
+
+test('falls back to the full command past the argv limit', () => {
+  const full = 'node --test';
+  const tooMany = Array.from({ length: 45 }, (_, i) => `/r/t${i}.test.js`);
+  assert.equal(narrowCommand({ command: full, testFiles: tooMany, root: '/r' }), full);
 });
 
 test('does not narrow a runner it cannot express safely', () => {

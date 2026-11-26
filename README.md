@@ -125,6 +125,8 @@ crucible verify [dir]     re-run the audit after a fix
 | `--no-mutation` | static checks only, no test runs |
 | `--limit=N` | audit at most N source files (default 12) |
 | `--profile=logic\|strict` | skip tuning constants (default) or mutate everything |
+| `--allow-env-noise` | audit even when the runner exits on an environment error |
+| `--force` | overwrite a generated test file that was edited by hand |
 
 ## Supported runners
 
@@ -300,6 +302,35 @@ expression.
   single file at most, or not at all.
 - **No discoverable test script means refusal, not a guess.** A wrong score is worse
   than no score.
+
+## When the suite fails for a reason that is not your code
+
+Four states, not two:
+
+| state | meaning |
+|---|---|
+| green | suite passed, results are trustworthy |
+| suite is red | tests fail; fix them first, mutation results would be meaningless |
+| environment error | tests pass but the run exits non-zero — a missing browser, an unreachable host, an unloadable native addon |
+| runner not found | dependencies are not installed, or the binary is missing |
+
+The environment case is worth naming because it looks like a failure and is not.
+axios is the reference: 2554 tests pass and vitest exits 1 because Playwright's
+Firefox and WebKit binaries are absent.
+
+```
+runner vitest (environment error)
+the tests themselves passed, but the run failed for an environment reason:
+a browser binary is missing. Run `npx playwright install`, then try again.
+Re-run with --allow-env-noise to audit anyway.
+```
+
+`--allow-env-noise` proceeds and marks the report, so a low score from tests that
+never started is not mistaken for a weak suite.
+
+The check is strict: passing tests, no failing tests, and a recognised error class.
+`0 passed` does not count — an environment error over a suite that never ran could
+hide real failures.
 
 ## License
 

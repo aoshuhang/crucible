@@ -45,6 +45,7 @@ const asJson = flags.has('--json');
 const verbose = flags.has('--verbose');
 const noMutation = flags.has('--no-mutation');
 const force = flags.has('--force');
+const allowEnvNoise = flags.has('--allow-env-noise');
 const limitArg = argv.find((a) => a.startsWith('--limit='));
 const maxFiles = limitArg ? Number(limitArg.split('=')[1]) : 12;
 
@@ -155,6 +156,7 @@ async function cmdScan() {
   let mutationFiles = [];
   let base = null;
   let suiteError = null;
+  let envNoise = null;
 
   if (!noMutation) {
     // Before running anything: if the declared runner is not installed, say so with
@@ -172,6 +174,15 @@ async function cmdScan() {
         });
       } else if (base.missing) {
         suiteError = base.hint ?? 'the test runner could not be started';
+      } else if (base.environmental && allowEnvNoise) {
+        // The user asked to proceed despite the environment noise. Say what was
+        // skipped so the report is not mistaken for a clean run.
+        envNoise = base.detail;
+        mutationFiles = await mutationPass(project, {
+          onProgress: (m) => { if (verbose) say(`  ${C.dim}${m}${C.reset}`); },
+        });
+      } else if (base.environmental) {
+        suiteError = `${base.hint}\n       Re-run with --allow-env-noise to audit anyway; results may miss tests that failed to start.`;
       } else {
         suiteError = 'suite is red before mutation, so mutation results would be meaningless';
       }
@@ -211,6 +222,7 @@ async function cmdScan() {
       summary,
       uncovered,
       truncated: project.truncated ?? false,
+      environmentNoise: envNoise,
       plan: planFor({
         findings: enriched,
         summary,
@@ -237,7 +249,9 @@ async function cmdScan() {
       ? ` ${C.dim}(green in ${base.ms}ms)${C.reset}`
       : base.missing
         ? ` ${C.yellow}(runner not found)${C.reset}`
-        : ` ${C.red}(suite is red)${C.reset}`;
+        : base.environmental
+          ? ` ${C.yellow}(environment error)${C.reset}`
+          : ` ${C.red}(suite is red)${C.reset}`;
 
   say(`  runner ${C.cyan}${project.runner.name}${C.reset}${stateLabel}`);
   say(`  ${project.sourceFiles.length} source, ${project.testFiles.length} test files`);
@@ -287,6 +301,13 @@ async function cmdScan() {
       say(`  ${f.relFile} ${C.dim}— ${f.skippedReason ?? 'mutations could not be applied'}${C.reset}`);
     }
     if (skippedFiles.length > 6) say(`  ${C.dim}... ${skippedFiles.length - 6} more${C.reset}`);
+    say('');
+  }
+
+  if (envNoise) {
+    say(`${C.yellow}${C.bold}Audit ran with environment noise${C.reset}`);
+    say(`  ${envNoise.what}. ${envNoise.fix}`);
+    say(`${C.dim}  Tests that failed to start could not catch a mutation, so the score may be low for that reason.${C.reset}`);
     say('');
   }
 
@@ -485,7 +506,9 @@ options:
   --verbose        show each mutation as it runs
   --no-mutation    static checks only (fast, no test runs)
   --limit=N        audit at most N source files (default 12)
-  --profile=NAME   logic (default, skips tuning constants) or strict`);
+  --profile=NAME   logic (default, skips tuning constants) or strict
+  --allow-env-noise audit even when the runner reports unhandled environment errors
+  --force          overwrite generated test files the user has edited`);
   process.exit(1);
 }
 

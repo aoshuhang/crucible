@@ -62,11 +62,17 @@ export function run(command, cwd, timeoutMs = 120_000) {
 export function narrowCommand({ command, testFiles, root }) {
   const base = addFailFast(command);
   if (!testFiles || testFiles.length === 0) return base;
-  // Too many files means the whole suite anyway; keep the proven full command.
-  if (testFiles.length > 6) return base;
 
   const rels = testFiles.map((f) => f.replace(root + '/', '')).filter(Boolean);
   if (rels.length === 0) return base;
+
+  // Narrow even when many files cover the source: 17 files out of axios's 185 is
+  // still a 10x reduction. The old cap of 6 meant every file in a large project fell
+  // back to the full suite, which is why one axios file took minutes.
+  //
+  // Above 40 the command starts exceeding practical argv limits and the source is
+  // usually a shared utility, so the whole suite is the honest choice.
+  if (rels.length > 40) return base;
 
   const quoted = rels.map((r) => JSON.stringify(r)).join(' ');
 
@@ -172,10 +178,16 @@ export async function judgeMutation({ root, file, command, mutation, timeoutMs =
  * Verify the baseline: the suite must pass before any mutation, otherwise every
  * result is meaningless (we would report SURVIVED for a suite that is already red).
  *
- * When the runner itself is missing, that is not a failing suite — it is a setup
- * problem, and telling the user "suite is red" would send them looking for a broken
- * test that does not exist. Exit 127 and "command not found" are reported as
- * `missing` instead.
+ * Three failure shapes, and they need different advice:
+ *
+ *   missing       the runner is not installed, or dependencies are not.
+ *   environmental the tests themselves pass, but the run exits non-zero because of
+ *                 something outside the code: a missing browser, an unreachable
+ *                 host, a native addon that will not load. axios hits this: 2554
+ *                 tests pass and vitest still exits 1 because Playwright's Firefox
+ *                 and WebKit binaries are absent. Saying "suite is red" sends the
+ *                 user looking for a broken test that does not exist.
+ *   red           actual test failures.
  */
 export async function baseline({ root, command, timeoutMs = 180_000 }) {
   const result = await run(command, root, timeoutMs);
@@ -200,11 +212,78 @@ export async function baseline({ root, command, timeoutMs = 180_000 }) {
     };
   }
 
+  if (!result.ok) {
+    const environmental = environmentalNoise(output);
+    if (environmental) {
+      return {
+        green: false,
+        environmental: true,
+        ms: result.ms,
+        command,
+        detail: environmental,
+        hint: `the tests themselves passed, but the run failed for an environment reason: ${environmental.what}. ${environmental.fix}`,
+        output: output.slice(-1500),
+      };
+    }
+  }
+
   return {
     green: result.ok,
     missing: false,
     ms: result.ms,
     output: output.slice(-4000),
+  };
+}
+
+/**
+ * Recognise a non-zero exit that is not a test failure.
+ *
+ * The rule: the output must show passing tests, no failing tests, and a known
+ * environment error. Only then is it safe to say the code is fine.
+ *
+ * @returns {{ what: string, fix: string } | null}
+ */
+export function environmentalNoise(output) {
+  // `[1-9]` matters: "0 passed" means the suite did not run, and an environment
+  // error on top of that could be hiding real failures.
+  const hasPassed = /\b[1-9]\d*\s+passed\b|\bTests\s+[1-9]\d*\s+passed/i.test(output);
+  const hasFailed = /\b[1-9]\d*\s+failed\b|FAIL\s/i.test(output);
+  const hasUnhandled = /Unhandled Error|unhandledRejection|uncaught exception/i.test(output);
+
+  if (!hasPassed || hasFailed) return null;
+
+  const known = [
+    {
+      test: /Executable doesn't exist|browserType\.launch|Please run.*playwright install/i,
+      what: 'a browser binary is missing',
+      fix: 'Run `npx playwright install` (or the equivalent for this project), then try again.',
+    },
+    {
+      test: /ECONNREFUSED|ENOTFOUND|getaddrinfo|network timeout/i,
+      what: 'a network host could not be reached',
+      fix: 'Start the required service or run the suite offline, then try again.',
+    },
+    {
+      test: /Cannot find native module|NODE_MODULE_VERSION|invalid ELF header|dlopen/i,
+      what: 'a native addon failed to load',
+      fix: 'Rebuild the native dependencies for this Node version (npm rebuild), then try again.',
+    },
+    {
+      test: /VITE_|missing env|environment variable .* is not defined/i,
+      what: 'an environment variable is missing',
+      fix: 'Provide the variable the suite expects, then try again.',
+    },
+  ];
+
+  if (!hasUnhandled) return null;
+
+  for (const entry of known) {
+    if (entry.test.test(output)) return { what: entry.what, fix: entry.fix };
+  }
+
+  return {
+    what: 'the runner reported an unhandled error while all tests passed',
+    fix: 'Read the tail of the run output to see which resource is missing, then try again.',
   };
 }
 
