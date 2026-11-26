@@ -38,6 +38,22 @@ const C = {
 
 const argv = process.argv.slice(2);
 
+/**
+ * Refuse on an old Node with a sentence, not a stack trace.
+ *
+ * The code needs Node 20 for stable `node --test` flags and `import.meta`. On 18 it
+ * would fail somewhere deep in a module load, and the first thing a stranger sees
+ * would be a SyntaxError they cannot act on.
+ */
+const nodeMajor = Number(process.versions.node.split('.')[0]);
+if (Number.isFinite(nodeMajor) && nodeMajor < 20) {
+  console.error(
+    `crucible needs Node 20 or newer. You have ${process.version}.\n`
+    + 'Upgrade Node (nvm install 20, or https://nodejs.org), then try again.',
+  );
+  process.exit(2);
+}
+
 // --version before anything else: an issue report needs it.
 if (argv.includes('--version') || argv.includes('-v')) {
   const { readFileSync } = await import('node:fs');
@@ -181,6 +197,20 @@ async function cmdCheck() {
   say(`${C.bold}crucible check${C.reset} ${C.dim}${project.root}${C.reset}`);
   say(`  ${project.testFiles.length} test files, ${project.sourceFiles.length} source files ${C.dim}(no tests executed)${C.reset}`);
   say('');
+
+  // "Nothing to report" and "I could not find your tests" look identical otherwise,
+  // and the second one told a Java project its tests were fine. Say which it is.
+  if (project.testFiles.length === 0) {
+    say(`${C.yellow}No test files were found.${C.reset}`);
+    if (project.sourceFiles.length === 0) {
+      say(`${C.dim}Nothing in ${project.root} looks like JavaScript, TypeScript, Python, Go, Rust or Swift source.${C.reset}`);
+    } else {
+      say(`${C.dim}${project.sourceFiles.length} source file${project.sourceFiles.length === 1 ? '' : 's'} found, but nothing matched a test naming convention`
+        + ` (*.test.js, *.spec.ts, test_*.py, *_test.go, *Tests.swift, or a tests/ directory).${C.reset}`);
+      say(`${C.dim}If this project does have tests, please open an issue with the layout — a language it cannot read is worth knowing about.${C.reset}`);
+    }
+    return;
+  }
 
   if (certain.length === 0 && suspect.length === 0) {
     say(`${C.green}No test that cannot fail.${C.reset}`);
