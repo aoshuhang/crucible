@@ -63,11 +63,26 @@ Requires Node 20 or newer. Nothing else.
 `crucible` ships a skill so a coding agent notices it without being told:
 
 ```bash
+npx @hsaohuang/crucible install
+```
+
+That copies `skills/crucible/SKILL.md` into every agent it finds —
+`~/.config/opencode/skills/crucible` and `~/.claude/skills/crucible` — and says
+which ones it skipped. Run it again after upgrading: a skill that lags one release
+behind keeps telling the agent about flags that changed, and nothing in the agent's
+answers says why.
+
+Then "check my tests" or "are these tests real" triggers it.
+
+From a checkout, link it instead, so your edits reach the agent:
+
+```bash
 ln -s "$PWD/skills/crucible" ~/.config/opencode/skills/crucible   # OpenCode
 ln -s "$PWD/skills/crucible" ~/.claude/skills/crucible            # Claude Code
 ```
 
-Then "check my tests" or "are these tests real" triggers it.
+`crucible install --dir=PATH` writes the skill somewhere else. `--force` replaces a
+copy you edited by hand; without it, a differing copy is reported and left as is.
 
 ---
 
@@ -206,6 +221,7 @@ never counted as a fake test.
 | `crucible scan [dir]` | seconds–minutes | mutates the source, finds boundaries no test covers |
 | `crucible fix [dir]` | seconds | writes the boundary tests that were missing |
 | `crucible verify [dir]` | seconds–minutes | re-runs `scan` after a fix, to see the score move |
+| `crucible install` | instant | copies the agent skill into OpenCode and Claude Code |
 
 `check` is the one you run while writing tests. `scan` is the one you run before a
 PR. `fix` is what you run when `scan` finds something.
@@ -220,7 +236,8 @@ PR. `fix` is what you run when `scan` finds something.
 | `--no-mutation` | scan | static checks only, no test runs |
 | `--profile=logic\|strict` | scan | skip tuning constants (default) or mutate everything |
 | `--allow-env-noise` | scan | audit even when the runner exits on an environment error |
-| `--force` | fix | overwrite a generated test file that was edited by hand |
+| `--force` | fix, install | overwrite a generated test file, or a skill copy, that was edited by hand |
+| `--dir=PATH` | install | copy the skill here instead of the detected agent directories |
 
 ### Exit codes
 

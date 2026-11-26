@@ -12,10 +12,12 @@
  *   crucible scan [dir]     report findings
  *   crucible fix  [dir]     write regression tests that pin real values
  *   crucible verify [dir]   re-run the audit after a fix
+ *   crucible install        copy the agent skill into the agent's skill directory
  */
 
 import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { join, basename } from 'node:path';
@@ -31,7 +33,8 @@ import { fixObjectBoundary } from '../src/fix-object.js';
 import { nextStepFor, planFor } from '../src/next.js';
 import { mapComparisonsToFunctions } from '../src/fix-boundary.js';
 import { mayWrite, stamp } from '../src/guard.js';
-import { relPosix, baseName, stem } from '../src/paths.js';
+import { relPosix, baseName, stem, toPosix } from '../src/paths.js';
+import { installSkill, defaultSkillTargets } from '../src/install.js';
 
 const C = {
   reset: '\u001b[0m', dim: '\u001b[2m', bold: '\u001b[1m',
@@ -623,15 +626,88 @@ async function cmdVerify() {
   await cmdScan();
 }
 
-const commands = { check: cmdCheck, scan: cmdScan, fix: cmdFix, verify: cmdVerify };
+/** `~/.config/...` reads better than `/Users/you/.config/...` in a one-line report. */
+function displayPath(p) {
+  const posix = toPosix(p);
+  const home = toPosix(homedir());
+  return posix === home || posix.startsWith(`${home}/`) ? `~${posix.slice(home.length)}` : posix;
+}
+
+/**
+ * Put the agent skill where the agent looks for it.
+ *
+ * Read this as an update, not a one-time install: the interesting case is a user
+ * who ran it two releases ago and whose SKILL.md now describes flags that changed.
+ */
+async function cmdInstall() {
+  const dirArg = argv.find((a) => a.startsWith('--dir='));
+  const explicit = dirArg ? dirArg.slice('--dir='.length) : positional[1];
+  const targets = explicit
+    ? [{ agent: 'custom path', target: explicit }]
+    : defaultSkillTargets();
+
+  say(`  ${C.bold}agent skill${C.reset}`);
+
+  let problems = 0;
+  for (const { agent, target } of targets) {
+    const result = await installSkill(target, { force });
+    const where = `${C.dim}${agent}${C.reset}  ${displayPath(target)}`;
+
+    switch (result.status) {
+      case 'installed':
+        say(`    ${C.green}installed${C.reset}   ${where}`);
+        break;
+      case 'replaced':
+        say(`    ${C.green}updated${C.reset}     ${where}`);
+        break;
+      case 'current':
+        say(`    ${C.dim}up to date${C.reset}  ${where}`);
+        break;
+      case 'symlink':
+        say(`    ${C.dim}left alone${C.reset}  ${where} ${C.dim}(symlink to ${result.link})${C.reset}`);
+        break;
+      case 'conflict':
+        problems += 1;
+        say(`    ${C.yellow}differs${C.reset}     ${where}`);
+        say(`      ${C.dim}${result.changed.join(', ')} changed since it was installed.${C.reset}`);
+        say(`      ${C.dim}Re-run with --force to replace it.${C.reset}`);
+        break;
+      case 'not-a-directory':
+        problems += 1;
+        say(`    ${C.red}not a directory${C.reset}  ${where}`);
+        break;
+      case 'no-source':
+        say(`    ${C.red}this install has no skill${C.reset}`);
+        say(`      ${C.dim}The package was published without skills/crucible. Reinstall from npm,${C.reset}`);
+        say(`      ${C.dim}or from a checkout: ln -s "$PWD/skills/crucible" ~/.config/opencode/skills/crucible${C.reset}`);
+        process.exitCode = 2;
+        return;
+      default:
+        problems += 1;
+        say(`    ${C.red}${result.status}${C.reset}  ${where}`);
+    }
+  }
+
+  if (problems > 0) {
+    process.exitCode = 1;
+    return;
+  }
+
+  say('');
+  say(`${C.dim}Restart your agent so it reads the skill, then ask: "are these tests real?"${C.reset}`);
+}
+
+const commands = { check: cmdCheck, scan: cmdScan, fix: cmdFix, verify: cmdVerify, install: cmdInstall };
 
 const USAGE = `usage:
   crucible check  [dir]   fast: read the tests, report those that cannot fail
   crucible scan   [dir]   slow: mutate the source, find untested boundaries
   crucible fix    [dir]   write the boundary tests that were missing
   crucible verify [dir]   re-run the audit after a fix
+  crucible install        copy the agent skill into OpenCode and Claude Code
 
   [dir] defaults to the current directory.
+  install finds ~/.config/opencode and ~/.claude by itself and leaves a symlink alone.
 
 options:
   --json            machine-readable output, with a next step per finding
@@ -641,6 +717,8 @@ options:
   --profile=NAME    scan: logic (default, skips tuning constants) or strict
   --allow-env-noise scan: audit even when the runner exits on an environment error
   --force           fix: overwrite a generated test file edited by hand
+                    install: replace a skill copy that differs from this one
+  --dir=PATH        install: copy the skill here instead of the detected agents
   --version, -v     print the version and platform
 
 examples:
@@ -648,10 +726,12 @@ examples:
   crucible check src/            # just one directory
   crucible scan --limit=3        # deeper look at three files
   crucible fix && crucible verify
+  crucible install               # let the agent notice crucible on its own
 
 exit codes:
   0  nothing certainly wrong
-  1  something cannot fail (check, scan) or the suite went red after a fix
+  1  something cannot fail (check, scan), the suite went red after a fix, or a
+     skill copy on disk is not the one this version ships
   2  could not run at all`;
 
 if (!command) {
