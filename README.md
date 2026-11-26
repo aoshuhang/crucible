@@ -428,6 +428,8 @@ Node 20 or newer. No other requirements.
 | `suite is red` | real test failures. Fix them first; mutation results would be meaningless. |
 | `file is not writable` | that source file was skipped. Nothing was changed. |
 | score looks too low | run with `--profile=strict` to include tuning constants, and check `--limit` covered the files you care about. |
+| `ENOVERSIONS No versions available` | the project's `.npmrc` sets `min-release-age`, which refuses packages published too recently. express ships one with `min-release-age=7`. Either wait, or add `--min-release-age=0` to the npx call. |
+| `EALLOWGIT Fetching packages of type git` | the registry or `.npmrc` disables git dependencies. Use the npm package instead of `npx github:...`. |
 
 If a report looks wrong — a test you know is fine gets flagged — that is the most
 valuable bug you can file. Include the test file and the command output.

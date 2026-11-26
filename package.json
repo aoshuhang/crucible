@@ -1,10 +1,10 @@
 {
   "name": "@hsaohuang/crucible",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Find AI-generated tests that assert nothing, then rewrite them until they actually catch bugs.",
   "type": "module",
   "bin": {
-    "crucible": "./bin/crucible.js"
+    "crucible": "bin/crucible.js"
   },
   "files": [
     "bin",
