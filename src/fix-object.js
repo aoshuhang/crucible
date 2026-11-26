@@ -20,6 +20,7 @@ import { readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { placement, parseProbeOutput } from './fix.js';
 import { run } from './judge.js';
+import { mayWrite, stamp } from './guard.js';
 
 /**
  * Extract `const NAME: Type = { ... };` literals from a test file.
@@ -357,7 +358,9 @@ export function isDirectlyObservable({ comparison, source, fnName }) {
 function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
-export async function fixObjectBoundary({ root, sourceFile, testFiles, fn, comparison, source, runner, runnerName }) {
+export async function fixObjectBoundary(options) {
+  const { root, sourceFile, testFiles, fn, comparison, source, runner, runnerName } = options;
+
   // Only comparisons that actually flip at equality are worth a boundary test.
   if (!['>=', '<=', '>', '<'].includes(comparison.op)) {
     return { written: null, cases: 0, reason: 'not a threshold comparison' };
@@ -502,7 +505,9 @@ export async function fixObjectBoundary({ root, sourceFile, testFiles, fn, compa
       comparison,
     });
 
-    await writeFile(fixPath, body, 'utf8');
+    const gate = await mayWrite(fixPath, { force: options.force });
+    if (!gate.write) return { written: null, cases: 0, reason: gate.reason };
+    await writeFile(fixPath, stamp(body, 'js'), 'utf8');
     return { written: fixPath, cases: 1 };
   } finally {
     await rm(probePath, { force: true });

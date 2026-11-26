@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { comparisonsIn, boundaryValues, boundarySensitive, resolveConstant } from './boundary-values.js';
 import { exportedNames, buildBoundaryTest, buildBoundaryProbe, parseProbeOutput, placement, suggestManualBoundary } from './fix.js';
 import { run } from './judge.js';
+import { mayWrite, stamp } from './guard.js';
 
 /**
  * Only comparisons whose function takes a numeric argument can be fixed
@@ -143,7 +144,8 @@ export function mapComparisonsToFunctions(source, filePath = '') {
  * Build and run the boundary fix for one source file.
  * @returns {Promise<{ written: string|null, cases: number, reason?: string }>}
  */
-export async function fixBoundaries({ root, sourceFile, testFiles, runner, runnerName }) {
+export async function fixBoundaries(options) {
+  const { root, sourceFile, testFiles, runner, runnerName } = options;
   const source = await readFile(sourceFile, 'utf8');
   const mapped = mapComparisonsToFunctions(source, sourceFile);
 
@@ -249,7 +251,9 @@ export async function fixBoundaries({ root, sourceFile, testFiles, runner, runne
         cases: usablePy,
       });
 
-      await writeFile(fixPath, pyBody, 'utf8');
+      const pyGate = await mayWrite(fixPath, { force: options.force });
+      if (!pyGate.write) return { written: null, cases: 0, reason: pyGate.reason };
+      await writeFile(fixPath, stamp(pyBody, 'py'), 'utf8');
       return { written: fixPath, cases: usablePy.length };
     }
 
@@ -288,7 +292,10 @@ export async function fixBoundaries({ root, sourceFile, testFiles, runner, runne
       cases: usable,
     });
 
-    await writeFile(fixPath, body, 'utf8');
+    const jsGate = await mayWrite(fixPath, { force: options.force });
+    if (!jsGate.write) return { written: null, cases: 0, reason: jsGate.reason };
+
+    await writeFile(fixPath, stamp(body, 'js'), 'utf8');
     return { written: fixPath, cases: usable.length };
   } finally {
     await rm(probePath, { force: true });

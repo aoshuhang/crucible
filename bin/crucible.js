@@ -27,6 +27,7 @@ import { fixBoundaries } from '../src/fix-boundary.js';
 import { fixObjectBoundary } from '../src/fix-object.js';
 import { nextStepFor, planFor } from '../src/next.js';
 import { mapComparisonsToFunctions } from '../src/fix-boundary.js';
+import { mayWrite, stamp } from '../src/guard.js';
 
 const C = {
   reset: '\u001b[0m', dim: '\u001b[2m', bold: '\u001b[1m',
@@ -43,6 +44,7 @@ const target = positional[1] ?? process.cwd();
 const asJson = flags.has('--json');
 const verbose = flags.has('--verbose');
 const noMutation = flags.has('--no-mutation');
+const force = flags.has('--force');
 const limitArg = argv.find((a) => a.startsWith('--limit='));
 const maxFiles = limitArg ? Number(limitArg.split('=')[1]) : 12;
 
@@ -347,6 +349,7 @@ async function cmdFix() {
       testFiles,
       runner: project.runner.command,
       runnerName: probeStyle,
+      force,
     });
 
     if (boundary.written) {
@@ -374,6 +377,7 @@ async function cmdFix() {
           comparison,
           source: sourceText,
           runner: probeStyle,
+          force,
         });
 
         if (result.written) {
@@ -431,7 +435,12 @@ async function cmdFix() {
         continue;
       }
 
-      await fs.writeFile(fixPath, body, 'utf8');
+      const gate = await mayWrite(fixPath, { force });
+      if (!gate.write) {
+        say(`  ${C.yellow}skip${C.reset} ${fixPath.replace(project.root + '/', '')} ${C.dim}(${gate.reason})${C.reset}`);
+        continue;
+      }
+      await fs.writeFile(fixPath, stamp(body, 'js'), 'utf8');
       written.push({ fixPath, kind: 'values' });
       say(`  ${C.green}wrote${C.reset} ${fixPath.replace(project.root + '/', '')}`
         + ` ${C.dim}(${probed.length} calls pinned)${C.reset}`);
