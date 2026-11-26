@@ -49,6 +49,11 @@ const SUSPECT_IDS = new Set([
 ]);
 
 export function gradeFinding(finding) {
+  // A test that runs several statements but asserts nothing is not provably fake: it
+  // may be a smoke test that fails when the code throws. Keep it in the report, out
+  // of the certain count.
+  if (finding.id === 'no-assertion' && finding.thin) return CONFIDENCE.SUSPECT;
+
   if (CERTAIN_IDS.has(finding.id)) return CONFIDENCE.CERTAIN;
   if (SUSPECT_IDS.has(finding.id)) return CONFIDENCE.SUSPECT;
   return CONFIDENCE.SUSPECT;

@@ -98,7 +98,7 @@ const PATTERNS = [
  * Handles `it('...', () => { ... })` and `it('...', function () { ... })`.
  * @returns {{ line: number, name: string, body: string, startLine: number }[]}
  */
-function testBlocks(source) {
+export function testBlocks(source) {
   const blocks = [];
   const lines = source.split('\n');
   const re = /\b(it|test)\s*\(\s*(['"`])((?:\\.|(?!\2).)*)\2/g;
@@ -108,12 +108,35 @@ function testBlocks(source) {
     const startIdx = m.index;
     const line = source.slice(0, startIdx).split('\n').length;
 
-    // Find the opening brace of the callback after the name.
-    const afterName = source.indexOf(m[0].length + startIdx);
+    // Find the callback's opening brace, not the first brace in the line.
+    //
+    // A test can take options before the callback:
+    //   it('name', { retry: 2 }, async () => {...})
+    // Taking the first `{` grabbed `{ retry: 2 }` as the body, so every assertion
+    // inside the real callback was invisible.
+    //
+    // The reliable signals are `=>` (arrow) and `function`. Prefer whichever comes
+    // first after the name; fall back to the old scan when neither is present.
     let braceIdx = -1;
-    for (let i = startIdx + m[0].length; i < source.length; i += 1) {
-      if (source[i] === '{') { braceIdx = i; break; }
-      if (source[i] === ')' && source[i - 1] !== '(') break;
+    const afterName = startIdx + m[0].length;
+    const head = source.slice(afterName, afterName + 2000);
+    const arrow = head.indexOf('=>');
+    const fnKeyword = head.indexOf('function');
+    const marker = arrow !== -1 && (fnKeyword === -1 || arrow < fnKeyword) ? arrow
+      : fnKeyword !== -1 ? fnKeyword : -1;
+
+    if (marker !== -1) {
+      for (let i = afterName + marker; i < source.length; i += 1) {
+        if (source[i] === '{') { braceIdx = i; break; }
+        if (source[i] === ';') break;
+      }
+    }
+
+    if (braceIdx === -1) {
+      for (let i = afterName; i < source.length; i += 1) {
+        if (source[i] === '{') { braceIdx = i; break; }
+        if (source[i] === ')' && source[i - 1] !== '(') break;
+      }
     }
     if (braceIdx === -1) continue;
 
@@ -140,43 +163,79 @@ function testBlocks(source) {
 }
 
 /**
- * Mask string and template literal contents before pattern matching, so sample
- * code inside a test fixture (e.g. a linter testing itself) is not mistaken for
- * real assertions.
+ * Strip string literals so pattern matching does not trip over prose.
  *
- * This matters more than it looks: the first project anyone points crucible at might
- * well be a tool that tests tools, and reporting its fixtures as fake tests would
- * destroy trust immediately.
+ * Returns a string of identical length where masked characters become spaces, so
+ * every index maps to the same index in the original.
+ *
+ * IMPORTANT: this walks the whole source, not one line. When it meets `//` it must
+ * skip to the end of that line and carry on — an earlier version used `break`,
+ * which silently discarded the rest of the file. That made every assertion after
+ * the first line comment invisible, and axios's test files are full of comments.
  */
 function maskStrings(source) {
   let out = '';
   let i = 0;
   let quote = null;
+  let inBlockComment = false;
 
   while (i < source.length) {
     const ch = source[i];
+    const next = source[i + 1];
 
-    if (quote) {
-      if (ch === '\\') {
+    if (inBlockComment) {
+      if (ch === '*' && next === '/') {
+        inBlockComment = false;
         out += '  ';
         i += 2;
         continue;
       }
-      if (ch === quote) {
-        quote = null;
-        out += ' ';
-        i += 1;
-        continue;
-      }
-      // Keep newlines so line numbers stay aligned.
       out += ch === '\n' ? '\n' : ' ';
       i += 1;
       continue;
     }
 
+    if (quote) {
+      if (ch === '\\') {
+        out += ch === '\\' ? ' ' : ' ';
+        out += next === '\n' ? '\n' : ' ';
+        i += 2;
+        continue;
+      }
+      if (ch === quote) {
+        quote = null;
+        out += ch;
+        i += 1;
+        continue;
+      }
+      out += ch === '\n' ? '\n' : ' ';
+      i += 1;
+      continue;
+    }
+
+    // Line comment: blank it out up to the newline, then keep going.
+    if (ch === '/' && next === '/') {
+      while (i < source.length && source[i] !== '\n') {
+        out += ' ';
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === '/' && next === '*') {
+      inBlockComment = true;
+      out += '  ';
+      i += 2;
+      continue;
+    }
+
     if (ch === '"' || ch === "'" || ch === '`') {
+      // Keep the delimiters, blank the contents. testBlocks needs to see `it('x'`
+      // to find a test, and a fully blanked string made every test invisible — but
+      // keeping the whole literal made code inside a template string look like real
+      // code. Blanking only the contents satisfies both.
       quote = ch;
-      out += ' ';
+      out += ch;
       i += 1;
       continue;
     }
@@ -223,6 +282,20 @@ export function scanTestSource(source, fileLabel, options = {}) {
   const maskedSource = useMask ? maskStrings(source) : source;
   const maskedLines = maskedSource.split('\n');
 
+  // Helpers defined in this file. A test that calls one of them may well be
+  // asserting inside it — axios has `testHeaderValue(request, key, value)` at the
+  // top of headers.browser.test.js and calls it from 54 tests, none of which contain
+  // a literal `expect`. Reporting those as "no assertion" is the kind of false
+  // positive that gets a tool uninstalled.
+  //
+  // We cannot resolve cross-file helpers without an import graph, so this is a
+  // deliberately generous rule: doubt means silence, not an accusation.
+  const localHelpers = new Set();
+  for (const re of [/\bfunction\s+([A-Za-z_$][\w$]*)\s*\(/g, /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function)/g]) {
+    let m;
+    while ((m = re.exec(maskedSource)) !== null) localHelpers.add(m[1]);
+  }
+
   // Line-level pattern hits, matched against the masked text so sample code inside
   // string literals is ignored. Type-only assertions need the real text, because
   // the type name lives inside a string literal.
@@ -256,12 +329,46 @@ export function scanTestSource(source, fileLabel, options = {}) {
     }
   }
 
-  // Block-level: a test with no assertion at all. Uses the masked source so a
-  // fixture that merely contains the word "expect" inside a string is not counted.
+  // Block-level: a test with no assertion at all.
+  //
+  // testBlocks must run on the ORIGINAL source: it matches `it('name', ...)`, and
+  // maskStrings blanks the quotes, which silently disabled every block-level check.
+  // The body is then re-masked so an `expect` inside a string does not count as an
+  // assertion.
   for (const block of testBlocks(maskedSource)) {
-    const hasAssert = /\b(expect|assert|should)\b/.test(block.body);
-    const hasThrow = /\bthrow\b/.test(block.body);
+    const maskedBody = maskStrings(block.body);
+
+    // Assertion dialects differ by framework:
+    //   vitest/jest  expect(x).toBe(y)
+    //   node:test    assert.equal(x, y)
+    //   ava / tap    t.true(x), t.is(x, y), t.deepEqual(...)
+    //   qunit        assert.ok(x)
+    //   deno         assertEquals(x, y) from @std/assert
+    // Missing the `t` form reported 282 "no assertion" findings on p-map, every one
+    // of them a well-written ava test. The trailing `\w*` covers assertEquals,
+    // assertThrows, assertNotEquals and friends.
+    const hasAssert = /\b(?:expect|assert\w*|should)\b/.test(maskedBody)
+      || /\bt\s*\.\s*(?:true|false|is|not|deepEqual|notDeepEqual|like|throws|throwsAsync|notThrows|snapshot|regex|pass|fail|ok|equal|same|plan|end|timeout)\s*\(/.test(maskedBody);
+
+    const hasThrow = /\bthrow\b/.test(maskedBody);
+    // A `try` without a swallowing catch is itself an assertion: if the call inside
+    // fails, the test fails. axios has tests that only run a command and clean up.
+    const hasTry = /\btry\s*\{/.test(maskedBody);
+
+    // Callback-style tests (mocha, jest): `function(done)` or `(done) =>`. Success is
+    // reported by calling done(), failure by done(err) or by throwing. express has
+    // seven of these, all legitimate.
+    const headLine = lines[block.startLine - 1] ?? '';
+    const hasDoneCallback = /\b(function\s*)?\(\s*(done|next)\s*\)/.test(headLine)
+      || /async\s*\(\s*(done|next)\s*\)/.test(headLine);
+    const callsDone = /\bdone\s*\(/.test(maskedBody);
+
     const isSkipped = /\.\s*(skip|todo)\s*\(/.test(maskedLines[block.startLine - 1] ?? '');
+
+    // Calling a helper defined in this file counts as possible assertion.
+    const callsLocalHelper = [...localHelpers].some(
+      (name) => new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`).test(maskedBody),
+    );
 
     // An empty catch is already reported at line level with a clearer reason;
     // do not double-report the same test.
@@ -269,17 +376,37 @@ export function scanTestSource(source, fileLabel, options = {}) {
       (f) => f.line >= block.startLine && f.line <= block.startLine + block.body.split('\n').length,
     );
 
-    if (!hasAssert && !hasThrow && !isSkipped && !alreadyReported) {
+    if (!hasAssert && !hasThrow && !hasTry && !hasDoneCallback && !callsDone && !isSkipped && !alreadyReported && !callsLocalHelper) {
       // Recover the original name text from the real source.
       const originalName = (lines[block.startLine - 1] ?? '').match(/(['"`])((?:\\.|(?!\1).)*)\1/)?.[2] ?? block.name;
+      // How much does this test actually do?
+      //
+      //   it('clamp runs', () => { clamp(5, 0, 10); })
+      //     one bare call to something that cannot throw — passes forever
+      //
+      //   it('should not throw', () => {
+      //     var router = new Router();
+      //     router.route('/foo').all(fn).all(fn);
+      //   })
+      //     builds objects and chains calls; if any of that throws, the test fails
+      //
+      // Both have no assertion, but only the first can never catch anything. Counting
+      // statements is a crude proxy and it is the honest one: the second stays in the
+      // report as something to review, not as a proven defect.
+      const statements = (maskedBody.match(/;/g) ?? []).length;
+      const thin = statements > 1;
+
       findings.push({
         id: 'no-assertion',
         file: fileLabel,
         line: block.startLine,
         kind: 'empty',
         snippet: `it('${originalName}')`,
-        why: 'test runs code but never asserts anything, so it passes even if the code is wrong',
+        why: thin
+          ? 'test runs several statements but asserts nothing; it only fails if the code throws'
+          : 'test calls code once and asserts nothing, so it passes even if the result is wrong',
         fix: 'assert on the result, or delete the test',
+        thin,
       });
     }
   }

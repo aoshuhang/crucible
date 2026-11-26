@@ -132,6 +132,71 @@ async function mutationPass(project, { onProgress } = {}) {
   return files;
 }
 
+/**
+ * Fast path: read the test files and report what cannot fail.
+ *
+ * No test is executed, so this finishes in well under a second even on a large
+ * project — fast enough to run the moment you finish writing a test, which is when
+ * the feedback is actually useful. It only sees what can be proven by reading:
+ * assertions that are true by construction, tests with no assertion at all,
+ * self-mocking, skipped tests.
+ *
+ * It cannot see a boundary that no test supplies; that needs `scan`.
+ */
+async function cmdCheck() {
+  const project = await discover(target);
+  const findings = await staticPass(project);
+
+  const certain = findings.filter((f) => f.confidence === CONFIDENCE.CERTAIN);
+  const suspect = findings.filter((f) => f.confidence === CONFIDENCE.SUSPECT);
+
+  if (asJson) {
+    return console.log(JSON.stringify({
+      root: project.root,
+      mode: 'static',
+      testFiles: project.testFiles.length,
+      summary: { cannotFail: certain.length, worthChecking: suspect.length },
+      findings: findings.map((f) => ({ ...f, next: nextStepFor(f, { root: project.root }) })),
+    }, null, 2));
+  }
+
+  say(`${C.bold}crucible check${C.reset} ${C.dim}${project.root}${C.reset}`);
+  say(`  ${project.testFiles.length} test files, ${project.sourceFiles.length} source files ${C.dim}(no tests executed)${C.reset}`);
+  say('');
+
+  if (certain.length === 0 && suspect.length === 0) {
+    say(`${C.green}No test that cannot fail.${C.reset}`);
+    say(`${C.dim}This is the static view. Run \`crucible scan\` to check for untested boundaries.${C.reset}`);
+    return;
+  }
+
+  if (certain.length > 0) {
+    say(`${C.red}${C.bold}Cannot fail${C.reset} ${C.dim}(${certain.length})${C.reset}`);
+    for (const f of certain) {
+      say(`  ${C.red}${f.file}:${f.line}${C.reset} ${C.dim}${f.id}${C.reset}`);
+      say(`    ${f.snippet}`);
+      say(`    ${C.dim}→ ${f.fix}${C.reset}`);
+    }
+    say('');
+  }
+
+  if (suspect.length > 0) {
+    say(`${C.dim}${C.bold}Worth a look${C.reset} ${C.dim}(${suspect.length})${C.reset}`);
+    for (const f of suspect.slice(0, 5)) {
+      say(`  ${C.dim}${f.file}:${f.line} ${f.id}${C.reset}`);
+    }
+    if (suspect.length > 5) say(`  ${C.dim}... ${suspect.length - 5} more${C.reset}`);
+    say('');
+  }
+
+  say(`${C.bold}${certain.length} test${certain.length === 1 ? '' : 's'} cannot fail${C.reset}`
+    + (suspect.length ? `, ${suspect.length} to review` : ''));
+
+  // A non-zero exit when something certainly cannot fail, so this works as a
+  // pre-commit hook or a CI step without parsing the output.
+  if (certain.length > 0) process.exitCode = 1;
+}
+
 async function cmdScan() {
   say(`${C.bold}crucible${C.reset} ${C.dim}${target}${C.reset}`);
 
@@ -491,7 +556,7 @@ async function cmdVerify() {
   await cmdScan();
 }
 
-const commands = { scan: cmdScan, fix: cmdFix, verify: cmdVerify };
+const commands = { check: cmdCheck, scan: cmdScan, fix: cmdFix, verify: cmdVerify };
 
 if (!commands[command]) {
   console.error(`unknown command: ${command}
