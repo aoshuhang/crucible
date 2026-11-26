@@ -46,13 +46,15 @@ test('mocha gets the same treatment', async (t) => {
   assert.match(p.runner.command, /node_modules\/\.bin\/mocha/);
 });
 
-test('does not double-prefix a command that already uses npx', async (t) => {
+test('never produces a runner command that reaches the npx cache', async (t) => {
+  // npx falls back to ~/.npm/_npx when the project has no node_modules, which runs
+  // an unrelated version of the binary. The command must address the local path.
   const dir = await project({ name: 'x', scripts: { test: 'npx --no-install ava' } });
   t.after(() => rm(dir, { recursive: true, force: true }));
 
   const p = await discover(dir);
-  assert.ok(!p.runner.command.includes('npx --no-install npx'),
-    `must not stack prefixes, got: ${p.runner.command}`);
+  assert.ok(!/\bnpx\b/.test(p.runner.command),
+    `npx must not appear in the runner command, got: ${p.runner.command}`);
 });
 
 test('leaves a node --test command alone', async (t) => {

@@ -71,7 +71,7 @@ export function narrowCommand({ command, testFiles, root }) {
   const quoted = rels.map((r) => JSON.stringify(r)).join(' ');
 
   if (/node_modules\/\.bin\/vitest|vitest run/.test(command)) {
-    return addFailFast(`./node_modules/.bin/vitest run ${quoted} --reporter=basic`);
+    return addFailFast(`./node_modules/.bin/vitest run ${quoted}`);
   }
   if (/node_modules\/\.bin\/jest|jest --ci/.test(command)) {
     return addFailFast(`./node_modules/.bin/jest ${quoted} --ci`);
@@ -138,6 +138,20 @@ export async function judgeMutation({ root, file, command, mutation, timeoutMs =
 
   try {
     await writeFile(file, applyMutation(original, mutation), 'utf8');
+  } catch (error) {
+    // A read-only file, a file owned by another user, a full disk. Writing is the
+    // one operation this tool cannot fake, and crashing with a stack trace tells
+    // the user nothing.
+    return {
+      verdict: 'SKIPPED',
+      reason: error.code === 'EACCES' || error.code === 'EPERM'
+        ? 'file is not writable, so it cannot be mutated in place'
+        : `could not write the mutation: ${error.message}`,
+      ms: 0,
+    };
+  }
+
+  try {
     const result = await run(command, root, timeoutMs);
 
     if (result.timedOut) return { verdict: 'ERRORED', reason: 'timeout', ms: result.ms };
@@ -148,7 +162,9 @@ export async function judgeMutation({ root, file, command, mutation, timeoutMs =
       output: result.ok ? '' : (result.stdout + result.stderr).slice(-2000),
     };
   } finally {
-    await writeFile(file, original, 'utf8');
+    // Restore even when the run threw. A crashed run must never leave the user's
+    // working tree modified.
+    await writeFile(file, original, 'utf8').catch(() => {});
   }
 }
 
@@ -310,6 +326,7 @@ export async function auditFile({ root, file, command, maxMutations = 12, profil
   const survivors = results.filter((r) => r.verdict === 'SURVIVED');
   const killed = results.filter((r) => r.verdict === 'KILLED');
   const errored = results.filter((r) => r.verdict === 'ERRORED');
+  const skipped = results.filter((r) => r.verdict === 'SKIPPED');
 
   const score = killed.length + survivors.length === 0
     ? null
@@ -322,6 +339,8 @@ export async function auditFile({ root, file, command, maxMutations = 12, profil
     killed: killed.length,
     survived: survivors.length,
     errored: errored.length,
+    skipped: skipped.length,
+    skippedReason: skipped[0]?.reason,
     score,
     survivors,
     results,

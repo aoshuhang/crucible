@@ -72,8 +72,16 @@ const PATTERNS = [
   {
     id: 'expect-in-callback-not-awaited',
     kind: 'async',
-    re: /expect\s*\([^)]*\)\s*\.\s*rejects/,
-    why: 'rejects/throws needs await; without it the assertion never runs',
+    // `.rejects` / `.resolves` return a promise. Without `await`, `return`, or an
+    // arrow-function implicit return, the assertion never runs and the test passes
+    // regardless.
+    //
+    // Both exemptions matter: axios has `await expect(x).rejects...` and also
+    // `const guard = (p) => expect(p).rejects...`, where the arrow returns the
+    // promise and the caller awaits it. Flagging either would be a false positive
+    // on well-written async tests, which is the fastest way to lose a user.
+    re: /(?<!await\s)(?<!return\s)(?<!=>\s)(?<!=>\s\s)\bexpect\s*\([^)]*\)\s*\.\s*(?:rejects|resolves)\b/,
+    why: 'rejects/resolves returns a promise; without await the assertion never runs',
     fix: 'prefix with await',
   },
   {
@@ -227,6 +235,15 @@ export function scanTestSource(source, fileLabel, options = {}) {
       if (!p.re) continue;
       const haystack = p.needsStrings ? line : masked;
       if (!p.re.test(haystack)) continue;
+
+      // A promise assertion on its own line is fine when the previous line opens an
+      // arrow body: `const guard = (p) =>` / `= async (p) =>`. That form returns the
+      // promise and the caller awaits it.
+      if (p.id === 'expect-in-callback-not-awaited') {
+        const prev = (maskedLines[i - 1] ?? '').trimEnd();
+        if (/=>$/.test(prev) || /=>\s*$/.test(prev)) continue;
+      }
+
       findings.push({
         id: p.id,
         file: fileLabel,

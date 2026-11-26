@@ -59,8 +59,24 @@ const SKIP_SOURCE_DIR = /(^|\/)(bin|scripts|cli|fixtures|__fixtures__)\//;
  * @property {{ command: string, name: string } | null} runner
  */
 
+/**
+ * Depth limit for the directory walk.
+ *
+ * 12 was too shallow: a Java or Kotlin project reaches
+ * `src/main/java/com/company/product/module/feature/...` easily, and a monorepo
+ * adds more on top. The walk silently found zero files and the report looked like
+ * a clean project with no source.
+ *
+ * 64 covers realistic nesting including deep Java package paths. Deeper than that
+ * output, and we say so instead of guessing.
+ */
+const MAX_DEPTH = 64;
+
 async function walk(dir, root, acc, depth = 0) {
-  if (depth > 12) return;
+  if (depth > MAX_DEPTH) {
+    acc.truncated = true;
+    return;
+  }
 
   let entries;
   try {
@@ -190,6 +206,75 @@ async function detectPackageManager(root) {
   return 'npm';
 }
 
+/**
+ * Resolve a package script to a runnable command, following `npm run <other>`.
+ *
+ * Real projects nest scripts: lodash's `test` is
+ * `npm run test:main && npm run test:fp`. Refusing all of those would reject a
+ * 40k-star project for no reason. The recursion is depth-limited because scripts
+ * can call each other in a cycle.
+ */
+async function resolveScript(root, scriptName, pkg, depth) {
+  if (depth > 3) return null;
+
+  const body = pkg.scripts?.[scriptName];
+  if (!body) return null;
+
+  const parts = body.split('&&').map((s) => s.trim()).filter(Boolean);
+  const kept = [];
+  let installed = true;
+
+  for (const part of parts) {
+    // Drop pure lint/typecheck steps.
+    if (/^(xo|eslint|biome|prettier|tsc|tsd|del-cli|jscs)\b/.test(part)) continue;
+
+    // Strip coverage wrappers but keep the command they wrap.
+    const unwrapped = part.replace(/^(c8|nyc|istanbul cover)\s+/, '');
+
+    // Follow a nested `npm run <name>`.
+    const nested = unwrapped.match(/^(?:npm|pnpm|yarn)\s+run\s+([\w:.-]+)$/);
+    if (nested) {
+      const inner = await resolveScript(root, nested[1], pkg, depth + 1);
+      if (inner) {
+        kept.push(inner.command);
+        if (!inner.installed) installed = false;
+      }
+      continue;
+    }
+
+    // Strip a leading `npx --no-install` / `bunx` / `pnpm exec`: the project's own
+    // script may use one, and we address the binary locally instead.
+    const stripped = unwrapped.replace(/^(?:npx\s+(?:--no-install\s+|-y\s+)?|bunx\s+|pnpm\s+exec\s+)/, '');
+
+    const bare = stripped.match(/^(ava|mocha|tap|uvu|jasmine|karma|vitest|jest)\b/);
+    if (bare) {
+      // A local binary is only on PATH inside `npm run`. Point at
+      // node_modules/.bin so a missing install fails loudly instead of silently
+      // reaching into the npx cache.
+      const bin = await localBin(root, bare[1]);
+      kept.push(bin ? stripped.replace(bare[1], bin) : `./node_modules/.bin/${stripped}`);
+      if (!bin) installed = false;
+      continue;
+    }
+
+    if (/node --test|node\s+-e/.test(unwrapped)) {
+      kept.push(unwrapped);
+      continue;
+    }
+
+    // `node test/test` — a project's own runner entry point. lodash uses this.
+    // It is a real test command, not a build step. Excluded are bare `node` calls
+    // with flags (--version, -p) and anything that is obviously a script command.
+    if (/^node\s+[^-\s]/.test(unwrapped) && /test|spec/i.test(unwrapped)) {
+      kept.push(unwrapped);
+      continue;
+    }
+  }
+
+  if (kept.length === 0) return null;
+  return { command: kept.join(' && '), name: 'package script', installed };
+}
+
 async function detectRunner(root) {
   const has = async (name) => {
     try {
@@ -223,7 +308,7 @@ async function detectRunner(root) {
       // against this project's code, and a crash from a version mismatch would be
       // reported as a failing suite.
       return {
-        command: `${vitestBin ?? './node_modules/.bin/vitest'} run --reporter=basic`,
+        command: `${vitestBin ?? './node_modules/.bin/vitest'} run`,
         name: 'vitest',
         installed: Boolean(vitestBin),
       };
@@ -241,32 +326,8 @@ async function detectRunner(root) {
     // and reporting every mutation as a survivor.
     const script = pkg.scripts?.test;
     if (script) {
-      const parts = script.split('&&').map((s) => s.trim());
-
-      const cleaned = parts
-        // Drop pure lint/typecheck steps.
-        .filter((s) => !/^(xo|eslint|biome|prettier|tsc|tsd|del-cli)\b/.test(s))
-        // Strip coverage wrappers but keep the command they wrap.
-        .map((s) => s.replace(/^(c8|nyc)\s+/, ''))
-        .filter((s) => /node --test|vitest|jest|mocha|ava|tape/.test(s))
-        .join(' && ')
-        .trim();
-
-      if (cleaned) {
-        // A local binary (ava, mocha, tap) is only on PATH inside `npm run`. Point
-        // at node_modules/.bin directly so a missing install fails loudly instead
-        // of silently reaching into the npx cache.
-        const bare = cleaned.match(/^(ava|mocha|tap|uvu|jasmine|karma|vitest|jest)\b/);
-        if (bare) {
-          const bin = await localBin(root, bare[1]);
-          return {
-            command: bin ? cleaned.replace(bare[1], bin) : `./node_modules/.bin/${cleaned}`,
-            name: 'package script',
-            installed: Boolean(bin),
-          };
-        }
-        return { command: cleaned, name: 'package script', installed: true };
-      }
+      const resolved = await resolveScript(root, 'test', pkg, 0);
+      if (resolved) return resolved;
     }
   }
 
@@ -325,7 +386,7 @@ async function detectRunner(root) {
  */
 export async function discover(root) {
   const abs = resolve(root);
-  const acc = { sourceFiles: [], testFiles: [] };
+  const acc = { sourceFiles: [], testFiles: [], truncated: false };
   await walk(abs, abs, acc);
 
   /** @type {Map<string,string[]>} */
@@ -402,5 +463,6 @@ export async function discover(root) {
     covers,
     runner: await detectRunner(abs),
     packageManager: await detectPackageManager(abs),
+    truncated: acc.truncated,
   };
 }

@@ -134,12 +134,18 @@ async function cmdScan() {
 
   const project = await discover(target);
   if (!project.runner) {
-    const msg = 'no test runner detected (looked for package.json test script, vitest, jest, pytest, go, cargo, swift)';
+    const msg = 'no test runner detected (looked for package.json test script, vitest, jest, ava, mocha, pytest, go, cargo, swift)';
     if (asJson) return console.log(JSON.stringify({ error: msg }, null, 2));
     console.error(`${C.red}${msg}${C.reset}`);
     process.exitCode = 2;
     return;
   }
+
+  // Files nothing references. Reporting zero findings for a project where nothing
+  // is covered would read as "healthy", which is the opposite of the truth.
+  const uncovered = [...project.covers.entries()]
+    .filter(([, tests]) => tests.length === 0)
+    .map(([src]) => src.replace(project.root + '/', ''));
 
   // Static findings need no execution, so report them even if the suite is red.
   const staticFindings = await staticPass(project);
@@ -201,6 +207,8 @@ async function cmdScan() {
       baselineMs: base?.ms ?? null,
       suiteError,
       summary,
+      uncovered,
+      truncated: project.truncated ?? false,
       plan: planFor({
         findings: enriched,
         summary,
@@ -213,6 +221,8 @@ async function cmdScan() {
         score: f.score,
         killed: f.killed,
         survived: f.survived,
+        skipped: f.skipped ?? 0,
+        skippedReason: f.skippedReason ?? null,
         confidence: f.grade.confidence,
         tests: f.testFiles,
       })),
@@ -259,6 +269,29 @@ async function cmdScan() {
   render('Tests that cannot fail', C.red, certain);
   render('Tests that do not check values', C.yellow, likely);
   render('Worth a look (may be intentional)', C.dim, suspect, 4);
+
+  if (uncovered.length > 0) {
+    say(`${C.yellow}${C.bold}No test covers these files${C.reset} ${C.dim}(${uncovered.length})${C.reset}`);
+    for (const f of uncovered.slice(0, 8)) say(`  ${f}`);
+    if (uncovered.length > 8) say(`  ${C.dim}... ${uncovered.length - 8} more${C.reset}`);
+    say(`${C.dim}This is not the same as a fake test: nothing runs these at all.${C.reset}`);
+    say('');
+  }
+
+  const skippedFiles = mutationFiles.filter((f) => f.skipped > 0);
+  if (skippedFiles.length > 0) {
+    say(`${C.yellow}${C.bold}Could not be audited${C.reset} ${C.dim}(${skippedFiles.length})${C.reset}`);
+    for (const f of skippedFiles.slice(0, 6)) {
+      say(`  ${f.relFile} ${C.dim}— ${f.skippedReason ?? 'mutations could not be applied'}${C.reset}`);
+    }
+    if (skippedFiles.length > 6) say(`  ${C.dim}... ${skippedFiles.length - 6} more${C.reset}`);
+    say('');
+  }
+
+  if (project.truncated) {
+    say(`${C.yellow}The directory walk stopped at the depth limit; some files were not seen.${C.reset}`);
+    say('');
+  }
 
   say(`${C.bold}${summary.fakeTests} tests cannot fail${C.reset}`
     + `, ${boundary.length} untested edge${boundary.length === 1 ? '' : 's'}`

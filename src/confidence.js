@@ -30,7 +30,6 @@ const CERTAIN_IDS = new Set([
   'always-true',
   'assert-true-literal',
   'no-assertion',
-  'empty-catch-in-test',
   'mock-self',
   'skipped',
   'expect-in-callback-not-awaited',
@@ -40,6 +39,13 @@ const CERTAIN_IDS = new Set([
 const SUSPECT_IDS = new Set([
   'not-null-only',
   'truthy-only',
+  'type-only',
+  // An empty catch inside a test file is often deliberate: a feature probe, an
+  // optional cleanup, a tolerant resolution like lodash's
+  // `try { realpathSync(p) } catch {}`. It only matters on the assertion path, and
+  // no static rule can tell which is which. lodash has 45 of these; calling all of
+  // them defects would destroy the report's credibility.
+  'empty-catch-in-test',
 ]);
 
 export function gradeFinding(finding) {
