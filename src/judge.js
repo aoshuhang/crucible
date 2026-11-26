@@ -127,15 +127,19 @@ export async function baseline({ root, command, timeoutMs = 180_000 }) {
 /**
  * Choose which mutations to run.
  *
- * Two rules, in order:
+ * The rule is proportional stratified sampling, and it exists because two simpler
+ * approaches both lied.
  *
- *   1. High-signal operators first. A flipped comparison or a negated condition
- *      tells you more about test quality than a bumped literal.
+ *   Priority only: 67% reported on a file whose true score was 44%. `number`
+ *   mutations sort last and got dropped, and those survive most often.
  *
- *   2. Even coverage across the file. Sampling purely by priority clusters the
- *      picks in whichever region holds the most comparisons, so a file whose first
- *      half is well tested and second half is bare scores the same as the reverse.
- *      We bucket by line number and take from each bucket.
+ *   One-per-kind: still 67%, because one number mutation out of ten is not a
+ *   representative sample of numbers, while four arithmetic mutations out of nine
+ *   over-weights the operator that dies easily.
+ *
+ * So each operator kind gets slots in proportion to how many of it exist, every
+ * kind is guaranteed at least one slot when it is present, and within a kind the
+ * picks spread across the file by line.
  *
  * @param {import('./mutate.js').Mutation[]} mutations
  * @param {number} max
@@ -144,41 +148,69 @@ export async function baseline({ root, command, timeoutMs = 180_000 }) {
 export function selectMutations(mutations, max) {
   if (mutations.length <= max) return mutations;
 
-  const priority = { comparison: 0, condition: 1, boolean: 2, statement: 3, return: 4, string: 5, arithmetic: 6, number: 7 };
-  const weight = (m) => priority[m.kind] ?? 9;
-
-  // Bucket by line so every region of the file gets a say.
-  const sorted = [...mutations].sort((a, b) => a.line - b.line);
-  const minLine = sorted[0].line;
-  const maxLine = sorted[sorted.length - 1].line;
-  const span = Math.max(1, maxLine - minLine + 1);
-  const buckets = new Map();
-
-  for (const m of sorted) {
-    const idx = Math.min(max - 1, Math.floor(((m.line - minLine) / span) * max));
-    if (!buckets.has(idx)) buckets.set(idx, []);
-    buckets.get(idx).push(m);
+  const byKind = new Map();
+  for (const m of mutations) {
+    if (!byKind.has(m.kind)) byKind.set(m.kind, []);
+    byKind.get(m.kind).push(m);
   }
 
-  const picked = [];
-  // One per bucket first, best operator within the bucket.
-  for (let i = 0; i < max; i += 1) {
-    const bucket = buckets.get(i);
-    if (!bucket || bucket.length === 0) continue;
-    bucket.sort((a, b) => weight(a) - weight(b));
-    picked.push(bucket.shift());
+  const total = mutations.length;
+  /** @type {{ kind: string, slots: number, list: any[] }[]} */
+  const groups = [...byKind.entries()].map(([kind, list]) => ({
+    kind,
+    list: [...list].sort((a, b) => a.line - b.line),
+    slots: Math.max(1, Math.round((list.length / total) * max)),
+  }));
+
+  // Never allocate more slots than the cap allows; trim the largest groups first.
+  let allocated = groups.reduce((n, g) => n + g.slots, 0);
+  while (allocated > max) {
+    groups.sort((a, b) => b.slots - a.slots);
+    const biggest = groups[0];
+    if (biggest.slots <= 1) break;
+    biggest.slots -= 1;
+    allocated -= 1;
   }
 
-  // Fill any remaining slots from whatever is left, best operator first.
-  if (picked.length < max) {
-    const rest = [...buckets.values()].flat().sort((a, b) => weight(a) - weight(b));
-    for (const m of rest) {
-      if (picked.length >= max) break;
-      picked.push(m);
+  // Give leftover slots back to the kinds with the most unreached members.
+  let remaining = max - allocated;
+  if (remaining > 0) {
+    const order = [...groups].sort((a, b) => (b.list.length / b.slots) - (a.list.length / a.slots));
+    let i = 0;
+    while (remaining > 0 && order.length > 0) {
+      const g = order[i % order.length];
+      if (g.slots < g.list.length) {
+        g.slots += 1;
+        remaining -= 1;
+      }
+      i += 1;
+      if (i > max * 4) break;
     }
   }
 
+  const picked = [];
+  for (const group of groups) {
+    pickSpread(group.list, group.slots, picked);
+  }
+
   return picked.slice(0, max);
+}
+
+/**
+ * Take `slots` items from a line-sorted list, spread evenly across it.
+ * Taking the first N would only ever test the top of the file.
+ */
+function pickSpread(list, slots, into) {
+  if (slots <= 0 || list.length === 0) return;
+  if (list.length <= slots) {
+    into.push(...list);
+    return;
+  }
+
+  for (let i = 0; i < slots; i += 1) {
+    const idx = Math.floor((i * (list.length - 1)) / Math.max(1, slots - 1));
+    into.push(list[idx]);
+  }
 }
 
 /**

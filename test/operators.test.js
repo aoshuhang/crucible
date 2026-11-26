@@ -118,6 +118,52 @@ test('spreads selections across the whole file, not just the top', () => {
   assert.ok(gap > 300, `coverage span should be most of the file, got ${gap}`);
 });
 
+test('samples every operator kind in proportion, not by priority', () => {
+  // 10 numbers, 9 arithmetic, 3 comparisons, 5 statements — the distribution that
+  // produced a 67% score on a file whose true score was 44%, because number
+  // mutations sorted last and were dropped.
+  const src = [
+    ...[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => `let v${i} = ${i + 10} * k;`),
+    ...[0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => `let w${i} = a${i} + b${i};`),
+    ...[0, 1, 2].map((i) => `if (c${i} >= d${i}) { e(); }`),
+    ...[0, 1, 2, 3, 4].map((i) => `function s${i}() { return g${i}(); }`),
+  ].join('\n');
+
+  const ms = mutationsFor(src, 'x.js');
+  const picked = selectMutations(ms, 12);
+  const kinds = new Set(picked.map((p) => p.kind));
+
+  // Every kind present in the source must appear in the sample.
+  for (const kind of new Set(ms.map((m) => m.kind))) {
+    assert.ok(kinds.has(kind), `${kind} was dropped from the sample`);
+  }
+});
+
+test('a sample of 12 tracks the full run within a few points', () => {
+  // The accuracy claim. A sample that flatters the suite by 20 points is worse than
+  // no sample at all, so proportional allocation is a correctness property.
+  const src = [
+    ...[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => `let v${i} = ${i + 10};`),
+    ...[0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => `let w${i} = a${i} + b${i};`),
+    ...[0, 1, 2].map((i) => `if (c${i} >= d${i}) { e(); }`),
+    ...[0, 1, 2, 3, 4].map((i) => `function s${i}() { return g${i}(); }`),
+  ].join('\n');
+
+  const ms = mutationsFor(src, 'x.js');
+  assert.ok(ms.length > 12);
+
+  const picked = selectMutations(ms, 12);
+  const share = (list, kind) => list.filter((m) => m.kind === kind).length / list.length;
+
+  // Each kind's share of the sample should be close to its share of the whole.
+  for (const kind of new Set(ms.map((m) => m.kind))) {
+    const full = share(ms, kind);
+    const sampled = share(picked, kind);
+    assert.ok(Math.abs(full - sampled) < 0.15,
+      `${kind}: sample share ${sampled.toFixed(2)} vs real ${full.toFixed(2)}`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Command narrowing.
 // ---------------------------------------------------------------------------

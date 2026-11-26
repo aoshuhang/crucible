@@ -220,7 +220,6 @@ MIT
 ## What changed after validation
 
 Three upgrades, each driven by a measurement rather than a guess:
-
 **Two profiles.** A bare tuning constant (`let maxHealth = 34`) is not a test-quality signal. Under the default `logic` profile those lines are skipped; formulas and comparisons inside declarations are still mutated, because they change behaviour. `--profile=strict` mutates everything. On the game prototype this moved a file from 25% to 58% — the earlier number was mostly counting rebalanced constants as defects.
 
 **Five more operators.** Condition negation (`if (x)` → `if (!x)`), statement removal (`return x` → `return undefined`), and string emptying (`'full'` → `''`) alongside the existing comparison/boolean/arithmetic/number/return set. Each one targets a failure the earlier set could not see: a branch never taken both ways, a return value nobody checks, a status string no test asserts.
