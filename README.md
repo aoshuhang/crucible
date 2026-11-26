@@ -2,14 +2,92 @@
 
 **Find the tests that cannot fail. Then fix them.**
 
-AI writes tests that pass. That is not the same as tests that test anything. `crucible` breaks your source code on purpose and checks whether your suite notices. When it doesn't, it writes the test you were missing.
+AI writes tests that pass. That is not the same as tests that test anything.
+`crucible` breaks your source on purpose, checks whether your suite notices, and
+when it doesn't, writes the test you were missing.
 
 ```bash
-npx crucible scan            # what your tests don't actually check
-npx crucible fix             # write the tests that would have caught it
+crucible check     # 0.1s — read the tests, find the ones that cannot fail
+crucible scan      # slower — break the source, find untested boundaries
+crucible fix       # write the boundary tests that were missing
 ```
 
-No config, no dependencies, works on any project with a test suite.
+Works on any project with a test suite. No config file, no dependencies, no
+account.
+
+---
+
+## Install
+
+**Nothing installed, run it now:**
+
+```bash
+npx crucible check
+```
+
+**Or install globally:**
+
+```bash
+npm install -g crucible
+crucible check
+```
+
+**Bleeding edge, straight from this repo** (no npm publish required):
+
+```bash
+npx github:aoshuhang/crucible check
+```
+
+**From source:**
+
+```bash
+git clone https://github.com/aoshuhang/crucible
+cd crucible
+npm link          # puts `crucible` on your PATH
+crucible check ~/code/my-project
+```
+
+Requires Node 20 or newer. Nothing else.
+
+### As an agent skill
+
+`crucible` ships a skill so a coding agent notices it without being told:
+
+```bash
+ln -s "$PWD/skills/crucible" ~/.config/opencode/skills/crucible   # OpenCode
+ln -s "$PWD/skills/crucible" ~/.claude/skills/crucible            # Claude Code
+```
+
+Then "check my tests" or "are these tests real" triggers it.
+
+---
+
+## 30 seconds on a real project
+
+```bash
+$ cd ~/code/my-project
+$ crucible check
+
+  crucible check  ~/code/my-project
+  1 test files, 1 source files (no tests executed)
+
+  Cannot fail (1)
+    test/cart.test.js:4  no-assertion
+      it('clamp runs')
+      → assert on the result, or delete the test
+
+  Worth a look (1)
+    test/cart.test.js:5 type-only
+
+  1 test cannot fail, 1 to review
+```
+
+Exit code is 1 when something certainly cannot fail, so it drops straight into a
+pre-commit hook or a CI step.
+
+`Cannot fail` means provable by reading one line. `Worth a look` means it might be
+intentional — a property test, a smoke test — and is never counted against the
+suite.
 
 ---
 
@@ -29,7 +107,8 @@ test('clamp runs', () => {
 });
 ```
 
-Both are green. Neither would notice a real bug. This is what AI generates by default, because "tests pass" is the only signal it optimises for.
+Both are green. Neither would notice a real bug. This is what AI generates by
+default, because "tests pass" is the only signal it optimises for.
 
 ## How crucible knows
 
@@ -112,21 +191,41 @@ never counted as a fake test.
 
 ## Commands
 
-```
-crucible scan   [dir]     report tests that cannot fail
-crucible fix    [dir]     write regression tests that pin real values
-crucible verify [dir]     re-run the audit after a fix
-```
+| command | speed | what it does |
+|---|---|---|
+| `crucible check [dir]` | **0.1s** | reads the test files, finds the ones that cannot fail. No tests are executed. |
+| `crucible scan [dir]` | seconds–minutes | mutates the source, finds boundaries no test covers |
+| `crucible fix [dir]` | seconds | writes the boundary tests that were missing |
+| `crucible verify [dir]` | seconds–minutes | re-runs `scan` after a fix, to see the score move |
 
-| flag | effect |
-|---|---|
-| `--json` | machine-readable output |
-| `--verbose` | print each mutation as it runs |
-| `--no-mutation` | static checks only, no test runs |
-| `--limit=N` | audit at most N source files (default 12) |
-| `--profile=logic\|strict` | skip tuning constants (default) or mutate everything |
-| `--allow-env-noise` | audit even when the runner exits on an environment error |
-| `--force` | overwrite a generated test file that was edited by hand |
+`check` is the one you run while writing tests. `scan` is the one you run before a
+PR. `fix` is what you run when `scan` finds something.
+
+### Flags
+
+| flag | applies to | effect |
+|---|---|---|
+| `--json` | all | machine-readable output, including a `next` block per finding |
+| `--limit=N` | scan, fix | audit at most N source files (default 12) |
+| `--verbose` | scan | print each mutation as it runs |
+| `--no-mutation` | scan | static checks only, no test runs |
+| `--profile=logic\|strict` | scan | skip tuning constants (default) or mutate everything |
+| `--allow-env-noise` | scan | audit even when the runner exits on an environment error |
+| `--force` | fix | overwrite a generated test file that was edited by hand |
+
+### Exit codes
+
+`check` and `scan` exit 1 when something is certainly wrong, 0 otherwise. That is
+all a pre-commit hook or a CI step needs:
+
+```bash
+# .git/hooks/pre-commit
+#!/bin/sh
+npx crucible check || {
+  echo "Some tests cannot fail. Fix them, or commit with --no-verify."
+  exit 1
+}
+```
 
 ## Supported runners
 

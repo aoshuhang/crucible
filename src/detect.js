@@ -372,8 +372,14 @@ export function scanTestSource(source, fileLabel, options = {}) {
 
     // An empty catch is already reported at line level with a clearer reason;
     // do not double-report the same test.
+    //
+    // The range is [startLine, startLine + bodyLines - 1]. Using +bodyLines without
+    // the -1 reached one line past the block, so a finding on the *next* test
+    // suppressed this one — which is why `test('clamp runs', () => { clamp(); })`
+    // followed by a type-only assertion was never reported.
+    const endLine = block.startLine + block.body.split('\n').length - 1;
     const alreadyReported = findings.some(
-      (f) => f.line >= block.startLine && f.line <= block.startLine + block.body.split('\n').length,
+      (f) => f.line >= block.startLine && f.line <= endLine,
     );
 
     if (!hasAssert && !hasThrow && !hasTry && !hasDoneCallback && !callsDone && !isSkipped && !alreadyReported && !callsLocalHelper) {

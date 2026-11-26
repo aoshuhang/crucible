@@ -214,3 +214,15 @@ test('code inside a template literal is not a real test', () => {
   const findings = scanTestSource(src, 'a.test.js');
   assert.equal(findings.filter((f) => f.id === 'no-assertion').length, 0);
 });
+
+test('a finding on the next test does not suppress this one', () => {
+  // The de-duplication range reached one line past the block, so a type-only
+  // finding on the following test hid a no-assertion finding on this one.
+  const src = [
+    "test('clamp runs', () => { clamp(5, 0, 10); });",
+    "test('total type', () => assert.equal(typeof total(2), 'number'));",
+  ].join('\n');
+  const findings = scanTestSource(src, 'a.test.js', { mask: false });
+  assert.equal(findings.filter((f) => f.id === 'no-assertion').length, 1,
+    'the first test has no assertion and must be reported');
+});
