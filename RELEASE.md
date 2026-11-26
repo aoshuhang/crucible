@@ -127,7 +127,7 @@ These are not caveats buried in a README. They are the boundaries of what the to
 
 **Runs are sequential.** Mutations rewrite source, so files cannot be processed in parallel. Large repos are slow; use `--limit`.
 
-**JS/TS is the best-covered path.** The Python, Go, Rust and Swift runners are detected and mutated, but the boundary-fixing logic has only been exercised on JS/TS projects so far.
+**JS/TS and Python have working fix paths.** Go, Rust and Swift are detected and mutated, but the boundary-fixing logic only knows how to write JS/TS and pytest. Go has no test-to-source import to follow; Rust tests live inside the source in `#[cfg(test)]`.
 
 ---
 
@@ -185,7 +185,7 @@ worse than no score.
 
 **Xcode projects are detected but impractically slow.** A single `xcodebuild test` cycle measured 5m37s on a real project, making a 12-mutation audit take over an hour. Technically supported, practically not.
 
-**JS/TS is the best-covered path.** Python, Go, Rust and Swift runners are detected and mutated, but the boundary-fixing logic has only been exercised on JS/TS.
+**JS/TS and Python have working fix paths.** Go, Rust and Swift are detected but boundary fixing only emits JS/TS and pytest code.
 
 **No discoverable test script means refusal, not a guess.** If the runner cannot be determined from `package.json` or a known config, `crucible` says so and stops. Guessing produced a confidently wrong `0%` score once, which is exactly the failure mode this tool exists to prevent.
 

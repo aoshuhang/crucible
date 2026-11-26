@@ -132,14 +132,24 @@ Detected automatically, no configuration:
 
 - **vitest**, **jest** (JS/TS)
 - **node:test** (JS/TS)
+- **ava**, **mocha**, **tap** (JS/TS, via the project's test script)
 - **pytest** (Python)
 - **go test**
 - **cargo test**
 - **swift test**
 
-Source files are matched to tests by resolving imports and, as a fallback, by
-basename reference. A file with no covering test is reported as *untested*, which
-is a different problem and is not counted as a fake test.
+`scan` works on all of them. `fix` writes JS/TS and pytest code; the others are
+detected and mutated but their repair still needs a hand-written test.
+
+Source files are matched to tests by resolving imports, by Go's `foo_test.go`
+sibling convention, and — as a fallback — by basename reference. A file with no
+covering test is reported as *untested*, which is a different problem and is not
+counted as a fake test.
+
+If the test command cannot be determined from `package.json` or a known config
+file, crucible refuses rather than guessing a glob. A guessed glob matches nothing,
+runs zero tests, and reports every mutation as a survivor — a confident `0%` about
+a healthy project.
 
 ## Safety
 
