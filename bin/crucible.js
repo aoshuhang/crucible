@@ -149,15 +149,24 @@ async function cmdScan() {
   let suiteError = null;
 
   if (!noMutation) {
-    base = await baseline({ root: project.root, command: project.runner.command });
-    if (base.green) {
-      mutationFiles = await mutationPass(project, {
-        onProgress: (m) => { if (verbose) say(`  ${C.dim}${m}${C.reset}`); },
-      });
-    } else if (base.missing) {
-      suiteError = base.hint ?? 'the test runner could not be started';
+    // Before running anything: if the declared runner is not installed, say so with
+    // the right install command for this project's package manager. Running it
+    // anyway would either fail obscurely or reach into the npx cache.
+    if (project.runner.installed === false) {
+      const pm = project.packageManager ?? 'npm';
+      const install = pm === 'bun' ? 'bun install' : `${pm} install`;
+      suiteError = `dependencies are not installed. Run \`${install}\` in ${project.root}, then try again.`;
     } else {
-      suiteError = 'suite is red before mutation, so mutation results would be meaningless';
+      base = await baseline({ root: project.root, command: project.runner.command });
+      if (base.green) {
+        mutationFiles = await mutationPass(project, {
+          onProgress: (m) => { if (verbose) say(`  ${C.dim}${m}${C.reset}`); },
+        });
+      } else if (base.missing) {
+        suiteError = base.hint ?? 'the test runner could not be started';
+      } else {
+        suiteError = 'suite is red before mutation, so mutation results would be meaningless';
+      }
     }
   }
 

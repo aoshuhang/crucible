@@ -152,6 +152,44 @@ function normalisePath(root, file) {
  * so every ava, mocha and tap project would be rejected with "suite is red".
  * Prefixing with `npx --no-install` fixes that without allowing a download.
  */
+/**
+ * Prefer the project's own binary over anything npx can find.
+ *
+ * `npx --no-install vitest` falls back to the npx cache when the project has no
+ * node_modules, so crucible could run an unrelated vitest version against the
+ * user's code and report a crash as a failing suite. The local bin is the only
+ * correct answer; when it is absent the project needs an install, and saying so
+ * is better than running the wrong tool.
+ */
+async function localBin(root, name) {
+  try {
+    await stat(join(root, 'node_modules', '.bin', name));
+    return `./node_modules/.bin/${name}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Detect which package manager the project uses, so the install hint is right.
+ */
+async function detectPackageManager(root) {
+  const has = async (name) => {
+    try {
+      await stat(join(root, name));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await has('pnpm-lock.yaml')) return 'pnpm';
+  if (await has('yarn.lock')) return 'yarn';
+  if (await has('bun.lockb')) return 'bun';
+  if (await has('package-lock.json')) return 'npm';
+  return 'npm';
+}
+
 async function detectRunner(root) {
   const has = async (name) => {
     try {
@@ -174,8 +212,29 @@ async function detectRunner(root) {
   if (pkg) {
     const deps = { ...pkg.dependencies, ...pkg.devDependencies };
 
-    if (deps.vitest) return { command: 'npx --no-install vitest run --reporter=basic', name: 'vitest' };
-    if (deps.jest) return { command: 'npx --no-install jest --ci', name: 'jest' };
+    // Prefer the project's own binary. Never let npx reach its cache.
+    const vitestBin = await localBin(root, 'vitest');
+    const jestBin = await localBin(root, 'jest');
+
+    if (deps.vitest || vitestBin) {
+      // If the dependency is declared but not installed, point at the local path
+      // anyway. It will fail with "no such file", which is honest: the project is
+      // not installed. Falling back to npx would run a cached version of vitest
+      // against this project's code, and a crash from a version mismatch would be
+      // reported as a failing suite.
+      return {
+        command: `${vitestBin ?? './node_modules/.bin/vitest'} run --reporter=basic`,
+        name: 'vitest',
+        installed: Boolean(vitestBin),
+      };
+    }
+    if (deps.jest || jestBin) {
+      return {
+        command: `${jestBin ?? './node_modules/.bin/jest'} --ci`,
+        name: 'jest',
+        installed: Boolean(jestBin),
+      };
+    }
 
     // Prefer the project's own test script: it knows where the tests live and
     // which flags they need. Guessing a glob is how you end up running zero tests
@@ -194,14 +253,19 @@ async function detectRunner(root) {
         .trim();
 
       if (cleaned) {
-        // A local binary (ava, mocha, tap) is only on PATH inside `npm run`. Use
-        // `npx --no-install` so it resolves from node_modules/.bin without a
-        // download. `node` and `npx` are already global; leave them alone.
-        const needsNpx = /^(ava|mocha|tap|uvu|jasmine|karma|vitest|jest)\b/.test(cleaned);
-        return {
-          command: needsNpx ? `npx --no-install ${cleaned}` : cleaned,
-          name: 'package script',
-        };
+        // A local binary (ava, mocha, tap) is only on PATH inside `npm run`. Point
+        // at node_modules/.bin directly so a missing install fails loudly instead
+        // of silently reaching into the npx cache.
+        const bare = cleaned.match(/^(ava|mocha|tap|uvu|jasmine|karma|vitest|jest)\b/);
+        if (bare) {
+          const bin = await localBin(root, bare[1]);
+          return {
+            command: bin ? cleaned.replace(bare[1], bin) : `./node_modules/.bin/${cleaned}`,
+            name: 'package script',
+            installed: Boolean(bin),
+          };
+        }
+        return { command: cleaned, name: 'package script', installed: true };
       }
     }
   }
@@ -337,5 +401,6 @@ export async function discover(root) {
     testFiles: acc.testFiles.sort(),
     covers,
     runner: await detectRunner(abs),
+    packageManager: await detectPackageManager(abs),
   };
 }

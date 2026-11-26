@@ -60,21 +60,62 @@ export function run(command, cwd, timeoutMs = 120_000) {
  * @returns {string} the command to use
  */
 export function narrowCommand({ command, testFiles, root }) {
-  if (!testFiles || testFiles.length === 0) return command;
+  const base = addFailFast(command);
+  if (!testFiles || testFiles.length === 0) return base;
   // Too many files means the whole suite anyway; keep the proven full command.
-  if (testFiles.length > 6) return command;
+  if (testFiles.length > 6) return base;
 
   const rels = testFiles.map((f) => f.replace(root + '/', '')).filter(Boolean);
-  if (rels.length === 0) return command;
+  if (rels.length === 0) return base;
 
   const quoted = rels.map((r) => JSON.stringify(r)).join(' ');
 
-  if (command.includes('vitest')) return `npx --no-install vitest run ${quoted} --reporter=basic`;
-  if (command.includes('jest')) return `npx --no-install jest ${quoted} --ci`;
+  if (/node_modules\/\.bin\/vitest|vitest run/.test(command)) {
+    return addFailFast(`./node_modules/.bin/vitest run ${quoted} --reporter=basic`);
+  }
+  if (/node_modules\/\.bin\/jest|jest --ci/.test(command)) {
+    return addFailFast(`./node_modules/.bin/jest ${quoted} --ci`);
+  }
+  if (/node_modules\/\.bin\/ava|\bava\b/.test(command)) {
+    return addFailFast(`./node_modules/.bin/ava ${quoted}`);
+  }
   if (command.includes('node --test')) return `node --test ${quoted}`;
 
   // pytest, go, cargo, swift, xcodebuild: keep the full command. Narrowing those
   // safely is runner-specific and getting it wrong produces false survivors.
+  return base;
+}
+
+/**
+ * Stop at the first failure.
+ *
+ * A mutation is judged by whether the suite fails at all, so there is nothing to
+ * learn from the remaining tests once one has failed. On a project with 400 tests
+ * this turns most mutation runs from a full suite into a fraction of one.
+ *
+ * Each runner spells it differently; the command is returned unchanged when the
+ * runner is not recognised rather than guessing a flag that would error.
+ */
+export function addFailFast(command) {
+  if (/--bail|--fail-fast|-x\b|-failfast/.test(command)) return command;
+
+  if (/node --test/.test(command)) return command; // node:test has no bail flag
+  if (/vitest|crucible|jest/.test(command)) {
+    if (/vitest/.test(command)) return `${command} --bail=1`;
+    if (/jest/.test(command)) return `${command} --bail=1`;
+  }
+  if (/\bava\b/.test(command)) return `${command} --fail-fast`;
+  if (/\bmocha\b/.test(command)) return `${command} --bail`;
+  if (/\btap\b/.test(command)) return `${command} --bail`;
+  if (/python3? -m pytest|pytest/.test(command)) {
+    return /-x\b/.test(command) ? command : `${command} -x`;
+  }
+  // Word boundary matters: "cargo test" contains the substring "go test".
+  if (/\bgo test\b/.test(command)) return `${command} -failfast`;
+  // cargo test already stops at the first failing test binary by default; there is
+  // no flag to add, and `-failfast` (a Go flag) would be rejected.
+  if (/\bcargo test\b/.test(command)) return command;
+
   return command;
 }
 
@@ -125,7 +166,10 @@ export async function baseline({ root, command, timeoutMs = 180_000 }) {
   const output = result.stdout + result.stderr;
 
   const missing = result.code === 127
-    || /command not found|No module named|not found in \$PATH|cannot find package/i.test(output);
+    || /command not found|No module named|not found in \$PATH|cannot find package/i.test(output)
+    // `npx --no-install` refuses when the binary is not in node_modules, which is
+    // what a fresh clone looks like before `npm install`.
+    || /npx canceled due to missing packages|could not determine executable|ENOENT.*spawn/i.test(output);
 
   if (missing) {
     return {
@@ -134,7 +178,9 @@ export async function baseline({ root, command, timeoutMs = 180_000 }) {
       ms: result.ms,
       command,
       output: output.slice(-1500),
-      hint: `the test runner is not installed: \`${command}\` could not run. Install its dependencies, then try again.`,
+      hint: /missing packages/i.test(output)
+        ? `dependencies are not installed. Run the project's install step (npm install / pnpm install / pip install -e .) and try again.`
+        : `the test runner is not installed: \`${command}\` could not run. Install its dependencies, then try again.`,
     };
   }
 

@@ -19,19 +19,23 @@ async function project(pkg) {
 }
 
 /**
- * A bare binary name like `ava` is only on PATH inside `npm run`, because npm adds
- * node_modules/.bin. Running it directly gives exit 127, which is indistinguishable
- * from a failing suite — so every ava/mocha/tap project was rejected with
- * "suite is red before mutation" and audited nothing.
+ * A bare binary name like `ava` is only on PATH inside `npm run`. Running it
+ * directly gives exit 127, which is indistinguishable from a failing suite.
+ *
+ * The first fix used `npx --no-install`, but that falls back to the npx cache when
+ * the project has no node_modules — so crucible would run an unrelated ava version
+ * against the user's code and report the resulting crash as a failing suite. The
+ * command now points at node_modules/.bin directly and marks whether it exists.
  */
-test('a local test binary is run through npx so it resolves', async (t) => {
+test('a local test binary is addressed by its local path', async (t) => {
   const dir = await project({ name: 'x', scripts: { test: 'ava' } });
   t.after(() => rm(dir, { recursive: true, force: true }));
 
   const p = await discover(dir);
   assert.ok(p.runner);
-  assert.match(p.runner.command, /npx --no-install ava/,
-    `a bare binary must be prefixed, got: ${p.runner.command}`);
+  assert.match(p.runner.command, /node_modules\/\.bin\/ava/,
+    `a bare binary must be addressed locally, got: ${p.runner.command}`);
+  assert.equal(p.runner.installed, false, 'and must report that it is not installed');
 });
 
 test('mocha gets the same treatment', async (t) => {
@@ -39,7 +43,7 @@ test('mocha gets the same treatment', async (t) => {
   t.after(() => rm(dir, { recursive: true, force: true }));
 
   const p = await discover(dir);
-  assert.match(p.runner.command, /npx --no-install mocha/);
+  assert.match(p.runner.command, /node_modules\/\.bin\/mocha/);
 });
 
 test('does not double-prefix a command that already uses npx', async (t) => {
