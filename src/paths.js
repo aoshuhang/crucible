@@ -39,3 +39,33 @@ export function stem(file) {
 export function isAbsolutePath(p) {
   return /^([A-Za-z]:[\\/]|[\\/])/.test(String(p));
 }
+
+/**
+ * The neighbouring comparison operator, for readable report text.
+ *
+ * Defined once here: it was duplicated in three places (boundary, fix, the CLI)
+ * and they could drift.
+ */
+export const NEIGHBOUR_OPERATOR = {
+  '<': '<=', '<=': '<', '>': '>=', '>=': '>',
+  '===': '!==', '!==': '===', '==': '!=', '!=': '==',
+};
+
+/**
+ * Quote a word for a POSIX shell.
+ *
+ * `JSON.stringify` was used here before, which produces DOUBLE quotes — and
+ * inside double quotes the shell still expands `$(…)`, backticks and `\`. A test
+ * file named `$(touch pwned).test.js` would execute its name. Single quotes are
+ * literal in POSIX sh; a single quote inside the value is spliced as `'\''`.
+ *
+ * These commands run through `exec(command, shell)` on the user's machine, so
+ * the quoting must hold for bash, zsh, dash and /bin/sh alike.
+ */
+export function shQuote(word) {
+  const s = String(word);
+  if (s === '') return "''";
+  // Nothing metacharacter-ish can appear: keep it readable.
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(s)) return s;
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}

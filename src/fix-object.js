@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import { placement, parseProbeOutput, frameworkImports } from './fix.js';
 import { run, registerTempFile, unregisterTempFile } from './judge.js';
 import { mayWrite, stamp } from './guard.js';
-import { stem, relPosix } from './paths.js';
+import { stem, relPosix, shQuote } from './paths.js';
 
 /**
  * Extract `const NAME: Type = { ... };` literals from a test file.
@@ -459,7 +459,7 @@ export async function fixObjectBoundary(options) {
     let probed = null;
 
     if (plainJs) {
-      const fileRun = await run(`node ${JSON.stringify(probePath)}`, root, 30_000);
+      const fileRun = await run(`node ${shQuote(probePath)}`, root, 30_000);
       probed = parseProbeOutput(fileRun.stdout + fileRun.stderr);
     }
 
@@ -469,10 +469,10 @@ export async function fixObjectBoundary(options) {
       // npx cache and run a different version against this project.
       const relProbe = relPosix(root, probePath);
       const onlyThis = runner.includes('vitest')
-        ? `./node_modules/.bin/vitest run ${JSON.stringify(relProbe)}`
+        ? `./node_modules/.bin/vitest run ${shQuote(relProbe)}`
         : runner.includes('jest')
-          ? `./node_modules/.bin/jest ${JSON.stringify(relProbe)} --ci`
-          : `node --test ${JSON.stringify(relProbe)}`;
+          ? `./node_modules/.bin/jest ${shQuote(relProbe)} --ci`
+          : `node --test ${shQuote(relProbe)}`;
 
       const runnerRun = await run(onlyThis, root, 120_000);
       probed = parseProbeOutput(runnerRun.stdout + runnerRun.stderr);

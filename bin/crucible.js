@@ -21,10 +21,10 @@ import { homedir, availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { join, basename, extname } from 'node:path';
-import { discover } from '../src/discover.js';
+import { discover, sfcScripts } from '../src/discover.js';
 import {
   baseline, run, restoreInFlightSync, cleanupSandboxesSync, cleanupTempFilesSync,
-  registerTempFile, unregisterTempFile,
+  registerTempFile, unregisterTempFile, restoreFailuresSeen,
 } from '../src/judge.js';
 import { buildPlan, executePlan, finalizePlan } from '../src/audit.js';
 import { loadCache, saveCache, cacheKey, cacheableResult, isUsableResult } from '../src/cache.js';
@@ -38,7 +38,7 @@ import { fixObjectBoundary } from '../src/fix-object.js';
 import { nextStepFor, planFor } from '../src/next.js';
 import { mapComparisonsToFunctions } from '../src/fix-boundary.js';
 import { mayWrite, stamp } from '../src/guard.js';
-import { relPosix, toPosix } from '../src/paths.js';
+import { relPosix, toPosix, shQuote, NEIGHBOUR_OPERATOR } from '../src/paths.js';
 import { installSkill, defaultSkillTargets } from '../src/install.js';
 
 const C = {
@@ -112,6 +112,7 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     if (restored > 0) {
       console.error(`\n${C.yellow}crucible: interrupted — restored ${restored} source file${restored === 1 ? '' : 's'}.${C.reset}`);
     }
+    reportRestoreFailures();
     process.exit(signal === 'SIGINT' ? 130 : 143);
   });
 }
@@ -119,7 +120,25 @@ process.on('exit', () => {
   restoreInFlightSync();
   cleanupSandboxesSync();
   cleanupTempFilesSync();
+  reportRestoreFailures();
 });
+
+/**
+ * A file that could not be restored is the worst outcome this tool can produce:
+ * the user's source is left mutated. It must be impossible to miss, on every
+ * exit path — signal, normal exit, crash. `exit` handlers cannot change the exit
+ * code, so the scan/fix flows also set it directly when they see a failure.
+ */
+function reportRestoreFailures() {
+  const failures = restoreFailuresSeen();
+  if (failures.length === 0) return;
+  console.error(`${C.red}${C.bold}crucible could not restore ${failures.length} file${failures.length === 1 ? '' : 's'} to their original content:${C.reset}`);
+  for (const { file, code, message } of failures) {
+    console.error(`  ${C.red}${file}${C.reset} ${C.dim}(${code ?? 'unknown error'}: ${message ?? ''})${C.reset}`);
+    console.error(`  ${C.dim}the original content was written next to it as ${file}.crucible-backup — copy it back, then re-run.${C.reset}`);
+  }
+  console.error(`${C.dim}Nothing else about this report can be trusted until the file is restored.${C.reset}`);
+}
 const flags = new Set(argv.filter((a) => a.startsWith('-')));
 const positional = argv.filter((a) => !a.startsWith('-'));
 // No command prints help. Defaulting to `scan` meant a curious first run spent a
@@ -180,10 +199,10 @@ const say = (...parts) => { if (!asJson) console.log(...parts); };
 
 /** The neighbouring operator, for readable report text. */
 function flipOf(op) {
-  return { '<': '<=', '<=': '<', '>': '>=', '>=': '>', '===': '!==', '!==': '===', '==': '!=', '!=': '==' }[op] ?? op;
+  return NEIGHBOUR_OPERATOR[op] ?? op;
 }
 
-/** Static pass over every test file. */
+/** Static pass over every test file, plus the script blocks of single-file components. */
 async function staticPass(project) {
   const findings = [];
 
@@ -201,6 +220,16 @@ async function staticPass(project) {
     }
   }
 
+  // A `.vue`/`.svelte` test file is not a `.test.js` file, but its `<script>`
+  // block can contain the tests. Reading it here means a Vue project's tests are
+  // checked instead of silently reported as "unsupported format".
+  for (const { path, script } of await sfcScripts(project.sfcFiles ?? [])) {
+    const rel = relPosix(project.root, path);
+    for (const f of scanTestSource(script, rel)) {
+      findings.push({ ...f, confidence: gradeFinding(f) });
+    }
+  }
+
   return findings;
 }
 
@@ -208,15 +237,19 @@ async function staticPass(project) {
 async function mutationPass(project, { onProgress } = {}) {
   // Sorted before slicing: `--limit` must pick the same files on every machine,
   // otherwise a CI run and a local run audit different subsets.
-  const covered = [...project.covers.entries()]
+  const coveredAll = [...project.covers.entries()]
     .filter(([, tests]) => tests.length > 0)
     .map(([file, testFiles]) => ({ file, testFiles }))
     // Byte order, not locale order: `--limit` must select the same files in CI and
     // locally, and localeCompare depends on the machine's ICU collation.
-    .sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0))
-    .slice(0, maxFiles);
+    .sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
 
-  if (covered.length === 0) return [];
+  // Saying nothing about the files `--limit` left out made a partial audit look
+  // like a full one. The count is reported so a CI step or an agent can tell.
+  const covered = coveredAll.slice(0, maxFiles);
+  const notAudited = coveredAll.length - covered.length;
+
+  if (covered.length === 0) return { files: [], notAudited: 0 };
 
   // An env-noise run audits a suite that did not fully start; caching those results
   // would let a later clean run reuse them.
@@ -286,27 +319,51 @@ async function mutationPass(project, { onProgress } = {}) {
     // missing edge case, not a vague complaint about test quality.
     const sourceLines = (await readFile(sourceFile, 'utf8')).split('\n');
     const ranked = rankSurvivors(result.survivors, sourceLines);
+    const rel = relPosix(project.root, sourceFile);
+
+    // Every surviving mutation is a finding. Non-boundary survivors (arithmetic,
+    // strings, dropped returns) used to vanish from the report entirely — a suite
+    // whose only gap was `*` -> `/` showed zero findings and exit 0. They are
+    // graded `suspect`: real gaps most of the time, but possibly equivalent
+    // mutants, so they never drive the headline count or the exit code.
+    const survivorFindings = ranked.map((s) => {
+      if (s.boundary || s.threshold) {
+        return {
+          id: 'untested-boundary',
+          file: rel,
+          line: s.mutation.line,
+          column: s.mutation.column ?? null,
+          kind: 'boundary',
+          snippet: s.described,
+          why: `no test covers the edge of this comparison: flipping ${s.mutation.original} to ${flipOf(s.mutation.original)} went unnoticed`,
+          fix: s.suggestion,
+          confidence: CONFIDENCE.LIKELY,
+        };
+      }
+      return {
+        id: `survived-${s.mutation.kind}`,
+        file: rel,
+        line: s.mutation.line,
+        column: s.mutation.column ?? null,
+        kind: 'survivor',
+        snippet: s.described,
+        why: `a deliberate break survived: ${s.mutation.description} went unnoticed by every covering test`,
+        fix: 'pin the value this expression produces, or accept it as an equivalent mutant',
+        confidence: CONFIDENCE.SUSPECT,
+      };
+    });
 
     files.push({
       ...result,
-      relFile: relPosix(project.root, sourceFile),
+      relFile: rel,
       testFiles: testFiles.map((t) => relPosix(project.root, t)),
       grade,
       cached,
-      survivorFindings: ranked.filter((s) => s.boundary || s.threshold).map((s) => ({
-        id: 'untested-boundary',
-        file: relPosix(project.root, sourceFile),
-        line: s.mutation.line,
-        kind: 'boundary',
-        snippet: s.described,
-        why: `no test covers the edge of this comparison: flipping ${s.mutation.original} to ${flipOf(s.mutation.original)} went unnoticed`,
-        fix: s.suggestion,
-        confidence: CONFIDENCE.LIKELY,
-      })),
+      survivorFindings,
     });
   }
 
-  return files;
+  return { files, notAudited };
 }
 
 /**
@@ -333,6 +390,7 @@ async function cmdCheck() {
       target: project.targetedFile ?? null,
       mode: 'static',
       testFiles: project.testFiles.length,
+      sfcFiles: (project.sfcFiles ?? []).map((f) => relPosix(project.root, f)),
       unsupported: project.unsupported ?? [],
       workspaces: (project.workspaces ?? []).map((dir) => relPosix(project.root, dir)),
       summary: { cannotFail: certain.length, worthChecking: suspect.length },
@@ -343,6 +401,9 @@ async function cmdCheck() {
   say(`${C.bold}crucible check${C.reset} ${C.dim}${project.root}${C.reset}`);
   say(`  ${project.testFiles.length} test file${project.testFiles.length === 1 ? '' : 's'}, `
     + `${project.sourceFiles.length} source file${project.sourceFiles.length === 1 ? '' : 's'} ${C.dim}(no tests executed)${C.reset}`);
+  if (project.sfcFiles?.length) {
+    say(`  ${C.dim}read the <script> block of ${project.sfcFiles.length} single-file component${project.sfcFiles.length === 1 ? '' : 's'} (.vue/.svelte)${C.reset}`);
+  }
   if (project.unsupported?.length) {
     const total = project.unsupported.reduce((n, item) => n + item.count, 0);
     const list = project.unsupported.map((item) => `${item.ext} (${item.count})`).join(', ');
@@ -450,6 +511,7 @@ async function cmdScan() {
   const staticFindings = await staticPass(project);
 
   let mutationFiles = [];
+  let notAudited = 0;
   let base = null;
   let suiteError = null;
   let envNoise = null;
@@ -464,19 +526,17 @@ async function cmdScan() {
       suiteError = `dependencies are not installed. Run \`${install}\` in ${project.root}, then try again.`;
     } else {
       base = await baseline({ root: project.root, command: project.runner.command });
-      if (base.green) {
-        mutationFiles = await mutationPass(project, {
+      if (base.green || (base.environmental && allowEnvNoise)) {
+        if (base.environmental) {
+          // The user asked to proceed despite the environment noise. Say what was
+          // skipped so the report is not mistaken for a clean run.
+          envNoise = base.detail;
+        }
+        ({ files: mutationFiles, notAudited } = await mutationPass(project, {
           onProgress: (m) => { if (verbose) say(`  ${C.dim}${m}${C.reset}`); },
-        });
+        }));
       } else if (base.missing) {
         suiteError = base.hint ?? 'the test runner could not be started';
-      } else if (base.environmental && allowEnvNoise) {
-        // The user asked to proceed despite the environment noise. Say what was
-        // skipped so the report is not mistaken for a clean run.
-        envNoise = base.detail;
-        mutationFiles = await mutationPass(project, {
-          onProgress: (m) => { if (verbose) say(`  ${C.dim}${m}${C.reset}`); },
-        });
       } else if (base.environmental) {
         suiteError = `${base.hint}\n       Re-run with --allow-env-noise to audit anyway; results may miss tests that failed to start.`;
       } else {
@@ -491,12 +551,13 @@ async function cmdScan() {
   ];
 
   // One finding per source location. A boundary survivor is strictly more
-  // specific than a generic "does not check values", so it wins.
+  // specific than a generic "does not check values", so it wins. The key carries
+  // the column: two boundaries on one line are two findings, not one.
   const byLocation = new Map();
   const priority = (f) => (f.kind === 'boundary' ? 3 : f.confidence === 'certain' ? 2 : 1);
 
   for (const f of allFindings) {
-    const key = `${f.file}:${f.line}`;
+    const key = `${f.file}:${f.line}:${f.column ?? 0}`;
     const existing = byLocation.get(key);
     if (!existing || priority(f) > priority(existing)) byLocation.set(key, f);
   }
@@ -518,6 +579,8 @@ async function cmdScan() {
   // Exit codes: something certainly wrong (1) is the CI signal; failing to run at
   // all (2) outranks it because the audit's result is not trustworthy.
   if (suiteError) process.exitCode = 2;
+  // A file left mutated outranks everything: the report's claims are void.
+  if (restoreFailuresSeen().length > 0) process.exitCode = 2;
   if (summary.fakeTests > 0 && !process.exitCode) process.exitCode = 1;
 
   // A score gate for CI. `--fail-under=N` is a promise to the build: if no score
@@ -563,6 +626,7 @@ async function cmdScan() {
       mutationScore: scorePercent,
       scoreGate,
       uncovered,
+      sfcFiles: (project.sfcFiles ?? []).map((f) => relPosix(project.root, f)),
       unsupported: project.unsupported ?? [],
       workspaces: (project.workspaces ?? []).map((dir) => relPosix(project.root, dir)),
       truncated: project.truncated ?? false,
@@ -576,16 +640,26 @@ async function cmdScan() {
         root: project.root,
       }),
       findings: enriched,
+      limit: maxFiles,
+      notAudited,
       files: mutationFiles.map((f) => ({
         file: f.relFile,
         score: f.score,
         killed: f.killed,
         survived: f.survived,
+        errored: f.errored ?? 0,
         skipped: f.skipped ?? 0,
         skippedReason: f.skippedReason ?? null,
         confidence: f.grade.confidence,
         tests: f.testFiles,
         cached: f.cached ?? false,
+        survivors: (f.survivors ?? []).map((s) => ({
+          line: s.mutation?.line ?? null,
+          column: s.mutation?.column ?? null,
+          kind: s.mutation?.kind ?? null,
+          original: s.mutation?.original ?? null,
+          description: s.mutation?.description ?? null,
+        })),
       })),
     }, null, 2));
   }
@@ -618,10 +692,10 @@ async function cmdScan() {
   say('');
 
   const boundary = deduped.filter((f) => f.kind === 'boundary');
-  const boundaryKeys = new Set(boundary.map((f) => `${f.file}:${f.line}`));
+  const boundaryKeys = new Set(boundary.map((f) => `${f.file}:${f.line}:${f.column ?? 0}`));
 
   // Group: certain first, because that is what we can defend.
-  const byConfidence = (c) => deduped.filter((f) => f.confidence === c && !boundaryKeys.has(`${f.file}:${f.line}`));
+  const byConfidence = (c) => deduped.filter((f) => f.confidence === c && !boundaryKeys.has(`${f.file}:${f.line}:${f.column ?? 0}`));
   const certain = byConfidence(CONFIDENCE.CERTAIN);
   const likely = byConfidence(CONFIDENCE.LIKELY);
   const suspect = byConfidence(CONFIDENCE.SUSPECT);
@@ -672,6 +746,14 @@ async function cmdScan() {
 
   if (project.truncated) {
     say(`${C.yellow}The directory walk stopped at the depth limit; some files were not seen.${C.reset}`);
+    say('');
+  }
+
+  // A partial audit must say it is partial. Silence here made a `--limit=12` run
+  // over a 40-file project read as "everything is fine".
+  if (notAudited > 0) {
+    say(`${C.yellow}${notAudited} covered file${notAudited === 1 ? ' was' : 's were'} not audited (over --limit=${maxFiles}).${C.reset}`);
+    say(`${C.dim}Re-run with --limit=${notAudited + maxFiles} or higher, or scan files individually.${C.reset}`);
     say('');
   }
 
@@ -845,7 +927,7 @@ async function cmdFix() {
       let probed = null;
       if (plainJs) {
         await writeFile(probePath, buildValueProbe({ importPath, sites }), 'utf8');
-        const probeRun = await run(`node ${JSON.stringify(probePath)}`, project.root, 60_000);
+        const probeRun = await run(`node ${shQuote(probePath)}`, project.root, 60_000);
         probed = parseProbeOutput(probeRun.stdout + probeRun.stderr);
       } else {
         await writeFile(probePath, buildProbe({ importPath, sites, runner: probeStyle }), 'utf8');
@@ -887,6 +969,7 @@ async function cmdFix() {
 
   if (written.length === 0) {
     say(`  ${C.dim}nothing to fix${C.reset}`);
+    emitFixJson({ written: [], rolledBack: false, suiteGreen: true });
     return;
   }
 
@@ -895,6 +978,7 @@ async function cmdFix() {
   if (after.green) {
     say(`${C.green}${C.bold}${written.length} file(s) written, suite still green.${C.reset}`);
     say(`Run ${C.cyan}crucible verify ${target}${C.reset} to see the new mutation score.`);
+    emitFixJson({ written, rolledBack: false, suiteGreen: true });
   } else {
     // Never leave the tree red. Restore every target to its pre-run state: files
     // that existed get their content back, files we created are removed.
@@ -909,7 +993,31 @@ async function cmdFix() {
     say(`${C.red}the suite went red after writing the new tests.${C.reset}`);
     say(`${C.dim}Rolled back ${restored} generated target${restored === 1 ? '' : 's'}; your tree is unchanged.${C.reset}`);
     process.exitCode = 1;
+    emitFixJson({ written: [], rolledBack: true, suiteGreen: false, rolledBackCount: restored });
   }
+}
+
+/**
+ * `fix --json` used to print nothing at all: every message went through `say`,
+ * which is silenced in JSON mode, while the README promised JSON for every
+ * command. An agent running `fix --json` got zero bytes and had to guess.
+ */
+function emitFixJson(result) {
+  if (!asJson) return;
+  console.log(JSON.stringify({
+    root: result.root ?? target,
+    command: 'fix',
+    written: (result.written ?? []).map((w) => ({
+      file: w.fixPath,
+      kind: w.kind,
+    })),
+    rolledBack: Boolean(result.rolledBack),
+    rolledBackCount: result.rolledBackCount ?? null,
+    suiteGreen: Boolean(result.suiteGreen),
+    next: result.rolledBack
+      ? { kind: 'review', instruction: 'The generated tests failed the suite and were rolled back. Inspect the pinned values by hand.' }
+      : { kind: 'run_command', command: `npx @hsaohuang/crucible scan ${JSON.stringify(target)} --json`, instruction: 'Re-run scan to confirm the score moved.' },
+  }, null, 2));
 }
 
 async function cmdVerify() {

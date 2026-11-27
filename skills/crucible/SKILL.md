@@ -48,20 +48,36 @@ Read the JSON, not the human output, when you need to act on it:
 ```json
 {
   "summary": { "fakeTests": 2, "likelyFake": 4, "worthChecking": 3 },
+  "limit": 12,
+  "notAudited": 3,
   "findings": [
     {
       "id": "no-assertion",
       "file": "test/cart.test.js",
       "line": 10,
+      "column": null,
       "kind": "empty",
       "snippet": "it('clamp runs')",
       "why": "test runs code but never asserts anything",
       "fix": "assert on the result, or delete the test",
       "confidence": "certain"
     }
+  ],
+  "files": [
+    {
+      "file": "src/cart.js",
+      "score": 0.5,
+      "killed": 6,
+      "survived": 6,
+      "survivors": [{ "line": 14, "column": 22, "kind": "arithmetic", "description": "flip * to /" }]
+    }
   ]
 }
 ```
+
+`notAudited` is the number of covered files `--limit` left out; if it is non-zero,
+the report is partial. `files[].survivors` names every surviving mutation, so you
+can write the missing test without re-running anything.
 
 ## How to read the confidence grades
 
@@ -96,3 +112,6 @@ expression and the case you need.
   untested edges.
 - Do not run it on Xcode projects. One `xcodebuild test` cycle was measured at
   5m37s, so an audit takes over an hour. Say so instead.
+- Do not ignore `notAudited` in the JSON: when it is non-zero, the report covered
+  only the first `limit` covered files, and "nothing found" means "nothing found
+  in those files".

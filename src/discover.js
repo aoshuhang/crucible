@@ -45,11 +45,18 @@ const SOURCE_EXT = new Set([
  * Source formats people reasonably expect to be audited but that crucible does not
  * parse. Counting them matters: silently skipping every `.vue` file in a Vue project
  * looks exactly like a clean report.
+ *
+ * `.vue` and `.svelte` are handled separately below: their `<script>` block IS
+ * JavaScript, so `check` can read it even though mutation cannot write it back
+ * safely. Everything else here stays counted-and-skipped.
  */
 const UNSUPPORTED_SOURCE_EXT = new Set([
-  '.vue', '.svelte', '.astro', '.rb', '.php', '.scala', '.ex', '.exs', '.erl',
+  '.astro', '.rb', '.php', '.scala', '.ex', '.exs', '.erl',
   '.hs', '.clj', '.cljs', '.dart', '.lua', '.fs', '.jl', '.m', '.mm',
 ]);
+
+/** Single-file components whose `<script>` block is JavaScript. */
+const SFC_EXT = new Set(['.vue', '.svelte']);
 
 /** Files that are entry points or config, not worth mutating. */
 const SKIP_SOURCE = /(^|\/)(main|setup|config|vite\.config|jest\.config|vitest\.config|webpack\.config|rollup\.config|tsup\.config|eslint\.config)\.[cm]?[jt]sx?$/;
@@ -59,6 +66,18 @@ const SKIP_SOURCE_EXT = /\.d\.[cm]?ts$/;
 
 /** Directories that are entry points rather than library code. */
 const SKIP_SOURCE_DIR = /(^|\/)(bin|scripts|cli|fixtures|__fixtures__)\//;
+
+/**
+ * Extract the `<script>` block from a single-file component.
+ *
+ * `check` analyses the script inside a `.vue`/`.svelte` file; without this the
+ * whole file was skipped as "unsupported" and the tests inside it were invisible.
+ * Returns null when there is no script block at all.
+ */
+export function sfcScript(source) {
+  const match = source.match(/<script[^>]*>([\s\S]*?)<\/script>/i);
+  return match ? match[1] : null;
+}
 
 /**
  * @typedef {object} Project
@@ -107,6 +126,17 @@ async function walk(dir, root, acc, depth = 0) {
 
     if (!entry.isFile()) continue;
     const ext = extname(entry.name).toLowerCase();
+
+    // A single-file component is not counted as "unsupported" when it actually
+    // carries a script block: the static pass can read that script even though
+    // `scan`/`fix` still cannot mutate the file. Vue projects were previously
+    // reported as "skipped: everything", which reads as "untested" at best and
+    // "fine" at worst — both wrong.
+    if (SFC_EXT.has(ext)) {
+      acc.sfcFiles.push(full);
+      continue;
+    }
+
     if (!SOURCE_EXT.has(ext)) {
       if (UNSUPPORTED_SOURCE_EXT.has(ext)) {
         if (!acc.unsupported) acc.unsupported = new Map();
@@ -152,12 +182,31 @@ function referencedSpecifiers(text) {
 /**
  * Normalise a module specifier to a comparable form: strip extension, strip
  * trailing /index, drop a leading './'.
+ *
+ * A dotted Python module (`from lib.mod import clamp`) refers to `lib/mod.py`,
+ * so dots become slashes. Dotless specifiers are left untouched — a package
+ * name like `slugify` must not be mangled.
  */
 function normaliseSpec(spec) {
   let s = spec.replace(/\\/g, '/');
   s = s.replace(/^\.\//, '');
   s = s.replace(/\.[cm]?[jt]sx?$/, '');
   s = s.replace(/\.py$/, '');
+  s = s.replace(/\/index$/, '');
+  if (!s.includes('/') && s.includes('.')) s = s.replace(/\./g, '/');
+  return s;
+}
+
+/**
+ * The JS counterpart: same normalisation, but dots are NEVER separators.
+ * `lodash.merge` is an npm package name; converting it to `lodash/merge` would
+ * falsely map a test onto a local file that happens to share the path.
+ * Exported for tests: the no-dot-conversion rule is the regression guard.
+ */
+export function normaliseJsSpec(spec) {
+  let s = spec.replace(/\\/g, '/');
+  s = s.replace(/^\.\//, '');
+  s = s.replace(/\.[cm]?[jt]sx?$/, '');
   s = s.replace(/\/index$/, '');
   return s;
 }
@@ -454,6 +503,28 @@ async function discoverFile(file) {
   };
 }
 
+/**
+ * Single-file components discovered by the walk, as readable script text.
+ *
+ * Used by `check`'s static pass: a `.vue` file's `<script setup>` holds real
+ * tests-or-code the detectors can read, even though mutation cannot write it.
+ * Returns `[{ path, script }]` — files without a script block are omitted.
+ */
+export async function sfcScripts(files) {
+  const out = [];
+  for (const file of files) {
+    let text;
+    try {
+      text = await readFile(file, 'utf8');
+    } catch {
+      continue;
+    }
+    const script = sfcScript(text);
+    if (script && script.trim()) out.push({ path: file, script });
+  }
+  return out;
+}
+
 /** Workspace globs declared by the project (npm/yarn `workspaces`, pnpm yaml). */
 async function workspacePatterns(root) {
   const patterns = [];
@@ -545,7 +616,7 @@ export async function discover(root) {
     if (info.isFile()) return discoverFile(abs);
   } catch { /* fall through to directory handling */ }
 
-  const acc = { sourceFiles: [], testFiles: [], truncated: false };
+  const acc = { sourceFiles: [], testFiles: [], sfcFiles: [], truncated: false };
   await walk(abs, abs, acc);
 
   /** @type {Map<string,string[]>} */
@@ -568,6 +639,11 @@ export async function discover(root) {
 
     const specs = referencedSpecifiers(text);
     const seen = new Set();
+    // Python resolves modules by dots (`from lib.mod import x`), JS by slashes.
+    // Dots-to-slashes must only apply to python tests: in a JS test,
+    // `import _ from 'lodash.merge'` is an npm package, and converting it would
+    // falsely map the test onto a local `lodash/merge.js` if one happens to exist.
+    const pythonTest = testFile.endsWith('.py');
 
     for (const spec of specs) {
       if (spec.startsWith('node:') || spec.startsWith('http')) continue;
@@ -575,13 +651,16 @@ export async function discover(root) {
       // Relative specifier: resolve against the test file's directory.
       let key = null;
       if (spec.startsWith('.')) {
-        const resolved = resolve(dirname(testFile), spec);
+        // A dot-leading Python relative import (`from .mod import clamp`) resolves
+        // against the test file's own package, same as a JS relative path — but
+        // dots are the separator, not a path prefix to strip.
+        const pyStyle = pythonTest && spec.split('/')[0].match(/^\.+(\w.*)$/);
+        const resolved = pyStyle
+          ? resolve(dirname(testFile), spec.replace(/^\.+/, '').replace(/\./g, '/'))
+          : resolve(dirname(testFile), spec);
         key = normalisePath(abs, resolved);
-      } else if (!spec.startsWith('@') && spec.includes('/')) {
-        // Python-style dotted module or a bare path; try as a project-relative path.
-        key = normaliseSpec(spec);
       } else {
-        key = normaliseSpec(spec);
+        key = pythonTest ? normaliseSpec(spec) : normaliseJsSpec(spec);
       }
 
       const target = byKey.get(key);
@@ -592,12 +671,17 @@ export async function discover(root) {
     }
 
     // Fallback: a test that mentions the source basename is likely covering it.
+    // Import/require specifiers are stripped first: `import x from 'lodash.merge'`
+    // mentions `merge`, but it names an npm package, not the local lodash/merge.js.
+    const stripped = text
+      .replace(/\b(?:from\s*|import\s*|require\s*\(\s*)['"][^'"]+['"]/g, '')
+      .replace(/\bimport\s*\(\s*['"][^'"]+['"]\s*\)/g, '');
     for (const src of acc.sourceFiles) {
       if (seen.has(src)) continue;
       const base = basename(src).replace(/\.[^.]+$/, '');
       if (base.length < 4) continue;
       const re = new RegExp(`\\b${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-      if (re.test(text)) {
+      if (re.test(stripped)) {
         seen.add(src);
         covers.get(src).push(testFile);
       }
@@ -621,6 +705,10 @@ export async function discover(root) {
     root: abs,
     sourceFiles: acc.sourceFiles.sort(),
     testFiles: acc.testFiles.sort(),
+    // Single-file components: their `<script>` block is readable JavaScript, so
+    // the static pass analyses it. They are NOT mutatable, so they never enter
+    // `sourceFiles`; the CLI labels them instead of implying full coverage.
+    sfcFiles: acc.sfcFiles.sort(),
     covers,
     runner: await detectRunner(abs),
     packageManager: await detectPackageManager(abs),

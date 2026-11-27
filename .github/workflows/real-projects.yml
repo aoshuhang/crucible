@@ -1,0 +1,71 @@
+name: real-projects
+
+# The unit suite proves the code does what it says. This job proves the CLAIMS do
+# what they say: zero false positives on real, well-written projects. The 0.2.0
+# fixes were all found by running against these repositories — without this job
+# the next regression ships.
+#
+# Manual or weekly, not per-PR: axios alone takes several minutes to install and
+# audit.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+
+jobs:
+  check-false-positives:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repo: axios/axios
+            expect: 0
+          - repo: expressjs/express
+            expect: 0
+          - repo: lodash/lodash
+            expect: 0
+          - repo: sindresorhus/p-map
+            expect: 0
+          - repo: chalk/chalk
+            expect: 0
+          - repo: sindresorhus/slugify
+            expect: 0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install the target project
+        run: |
+          git clone --depth 1 "https://github.com/${{ matrix.repo }}" target-project
+          cd target-project
+          # express ships an .npmrc with min-release-age that refuses a fresh
+          # publish; relax it so the install succeeds.
+          if [ -f .npmrc ]; then echo 'min-release-age=0' >> .npmrc; fi
+          npm install --no-audit --no-fund
+
+      - name: crucible check reports zero false positives
+        run: |
+          # `check` exits 1 only when something CERTAINLY cannot fail. On these
+          # projects that number must be zero — every "certain" finding on a
+          # well-written project is a false positive and a credibility bug.
+          node bin/crucible.js check target-project --json > report.json || true
+          node -e '
+            const r = JSON.parse(require("fs").readFileSync("report.json", "utf8"));
+            const cannotFail = r.summary.cannotFail;
+            const expect = Number(process.argv[1]);
+            if (cannotFail !== expect) {
+              console.error(`FAIL: ${cannotFail} certain findings on a healthy project (expected ${expect})`);
+              for (const f of r.findings.filter((x) => x.confidence === "certain").slice(0, 10)) {
+                console.error(`  ${f.file}:${f.line} ${f.id} — ${f.snippet}`);
+              }
+              process.exit(1);
+            }
+            console.log(`OK: ${cannotFail} certain findings, ${r.summary.worthChecking} to review`);
+          ' "${{ matrix.expect }}"

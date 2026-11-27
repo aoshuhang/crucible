@@ -11,7 +11,7 @@
  * formatting or comments proves nothing.
  */
 
-/** @typedef {{ id: string, kind: string, line: number, original: string, mutated: string, description: string }} Mutation */
+/** @typedef {{ id: string, kind: string, line: number, column: number, original: string, mutated: string, description: string }} Mutation */
 
 /**
  * Operator table. Order matters: longest first, because the scanner consumes
@@ -42,6 +42,147 @@ const NUMBER_LITERALS = /\b(\d+(?:\.\d+)?)\b/g;
 const SKIP_LINE = /^\s*(\/\/|\/\*|\*|#|import\s|from\s|require\(|'use strict'|"use strict")/;
 
 /**
+ * Words after which a `/` starts a regex literal, not division.
+ * `return /x/` is a regex; `a / b` is division. Telling them apart by the previous
+ * significant token is the classic heuristic and covers real code.
+ */
+const REGEX_PRECEDING_WORDS = new Set([
+  'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw',
+  'case', 'do', 'else', 'yield', 'await',
+]);
+
+/**
+ * Mask string/template/comment/regex contents across a WHOLE file.
+ *
+ * Returns a string of identical length where masked characters become spaces, so
+ * every index in the result maps to the same index in the original.
+ *
+ * This used to run per line, which could not carry state across a newline: the
+ * second line of a block comment, the continuation of a template literal holding
+ * SQL, and regex bodies all looked like live code and got mutated. A mutant that
+ * only breaks prose is either a syntax error (falsely counted as a kill) or a
+ * no-op — both corrupt the score.
+ *
+ * String, template and regex delimiters are KEPT and only their contents are
+ * blanked, so the string operator can still locate literals by their quotes and
+ * map positions back to the original text. `${ … }` interpolation markers are
+ * blanked, the code inside them is not — that is real code.
+ */
+function maskCode(source) {
+  const n = source.length;
+  const out = Array.from(source);
+  const blank = (i) => { if (source[i] !== '\n') out[i] = ' '; };
+
+  let i = 0;
+  let prevCode = '';   // last significant character seen in code mode
+  let prevWord = '';   // last identifier seen in code mode
+  const stack = [];    // nested template contexts: { kind: 'tpl' } | { kind: 'interp', braces }
+
+  while (i < n) {
+    const ch = source[i];
+    const next = source[i + 1] ?? '';
+    if (ch === '\n') { i += 1; continue; }
+
+    const top = stack[stack.length - 1];
+
+    if (top?.kind === 'tpl') {
+      if (ch === '\\') { blank(i); blank(i + 1); i += 2; continue; }
+      if (ch === '`') { blank(i); stack.pop(); i += 1; prevCode = '`'; prevWord = ''; continue; }
+      if (ch === '$' && next === '{') {
+        blank(i); blank(i + 1);
+        stack.push({ kind: 'interp', braces: 0 });
+        i += 2; prevCode = '{'; prevWord = '';
+        continue;
+      }
+      blank(i); i += 1; continue;
+    }
+
+    // A `${` interpolation counts its own braces so `${ { a: 1 } }` ends at the
+    // right `}`, not at the first one.
+    if (top?.kind === 'interp') {
+      if (ch === '{') { top.braces += 1; prevCode = '{'; prevWord = ''; i += 1; continue; }
+      if (ch === '}') {
+        if (top.braces > 0) { top.braces -= 1; prevCode = '}'; prevWord = ''; i += 1; continue; }
+        blank(i); stack.pop(); i += 1; prevCode = '}'; prevWord = '';
+        continue;
+      }
+    }
+
+    if (ch === '/' && next === '/') {
+      while (i < n && source[i] !== '\n') { blank(i); i += 1; }
+      continue; // comments never change what may follow them
+    }
+    if (ch === '/' && next === '*') {
+      blank(i); blank(i + 1); i += 2;
+      while (i < n && !(source[i] === '*' && source[i + 1] === '/')) { blank(i); i += 1; }
+      if (i < n) { blank(i); blank(i + 1); i += 2; }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      blank(i); i += 1;
+      while (i < n && source[i] !== quote && source[i] !== '\n') {
+        if (source[i] === '\\') { blank(i); blank(i + 1); i += 2; continue; }
+        blank(i); i += 1;
+      }
+      if (i < n && source[i] === quote) { blank(i); i += 1; }
+      prevCode = quote; prevWord = '';
+      continue;
+    }
+    if (ch === '`') { blank(i); stack.push({ kind: 'tpl' }); i += 1; prevCode = '`'; prevWord = ''; continue; }
+    if (ch === '/' && regexStartsHere(prevCode, prevWord)) {
+      blank(i); i += 1;
+      let inClass = false;
+      while (i < n) {
+        const c = source[i];
+        if (c === '\\') { blank(i); blank(i + 1); i += 2; continue; }
+        if (c === '\n') break; // not a regex after all; stop masking, keep going
+        if (c === '[') { inClass = true; blank(i); i += 1; continue; }
+        if (c === ']') { inClass = false; blank(i); i += 1; continue; }
+        if (c === '/' && !inClass) { blank(i); i += 1; break; }
+        blank(i); i += 1;
+      }
+      while (i < n && /[a-z]/i.test(source[i])) { blank(i); i += 1; } // flags
+      prevCode = '/'; prevWord = '';
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(ch)) {
+      let j = i;
+      while (j < n && /[\w$]/.test(source[j])) j += 1;
+      prevWord = source.slice(i, j);
+      prevCode = 'w';
+      i = j;
+      continue;
+    }
+    if (/[0-9]/.test(ch)) {
+      // A number is an operand: `100 / 5` is division, not the start of a regex.
+      // Treating digits as operand context (like identifiers) keeps the division
+      // operator mutable.
+      let j = i;
+      while (j < n && /[\w.]/.test(source[j])) j += 1;
+      prevWord = '';
+      prevCode = 'w';
+      i = j;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t' || ch === '\r') { i += 1; continue; }
+    prevCode = ch; prevWord = '';
+    i += 1;
+  }
+
+  return out.join('');
+}
+
+/** A `/` here starts a regex literal rather than division. */
+function regexStartsHere(prevCode, prevWord) {
+  if (prevWord && REGEX_PRECEDING_WORDS.has(prevWord)) return true;
+  // After an operand the `/` must be division.
+  if (prevCode === 'w' || prevCode === ')' || prevCode === ']' || prevCode === '"'
+    || prevCode === "'" || prevCode === '`' || prevCode === '/' || prevCode === '}') return false;
+  return true; // start of file, or after ( , = : ; ! ? & | etc.
+}
+
+/**
  * A line that only assigns a literal: `let maxHealth = 34;`
  *
  * These are the tuning constants of a program — health, speed, damage, tax rates.
@@ -59,69 +200,18 @@ const DECLARATION_ONLY = /^\s*(?:let|const|var)\s+[\w$]+\s*(?::\s*[^=]+)?=\s*(?:
 /** A string literal in a return or assignment: `return 'full';` */
 
 /**
- * Strip string literals and comments so we never mutate prose.
- * Returns a string of identical length where masked characters become spaces,
- * so every index in the result maps to the same index in the original line.
- */
-function maskLiterals(line) {
-  let out = '';
-  let i = 0;
-  let quote = null;
-  let inBlockComment = false;
-
-  while (i < line.length) {
-    const ch = line[i];
-    const next = line[i + 1];
-
-    if (inBlockComment) {
-      if (ch === '*' && next === '/') {
-        inBlockComment = false;
-        out += '  ';
-        i += 2;
-        continue;
-      }
-      out += ' ';
-      i += 1;
-      continue;
-    }
-
-    if (quote) {
-      if (ch === '\\') {
-        out += '  ';
-        i += 2;
-        continue;
-      }
-      if (ch === quote) quote = null;
-      out += ' ';
-      i += 1;
-      continue;
-    }
-
-    if (ch === '/' && next === '/') break;
-    if (ch === '/' && next === '*') {
-      inBlockComment = true;
-      out += '  ';
-      i += 2;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === '`') {
-      quote = ch;
-      out += ' ';
-      i += 1;
-      continue;
-    }
-
-    out += ch;
-    i += 1;
-  }
-
-  return out;
-}
-
-/**
  * Find operator positions in a masked line, longest match wins.
  * Each position is claimed at most once so we never emit two mutations that
  * target the same characters.
+ *
+ * Comparison operators are only counted where a comparison can exist — an
+ * operand-shaped token on both sides. This is what keeps
+ *   xs.map(x => x * 2)          — an arrow, not `=` + `>`
+ *   (x << 2) + (x >> 1)         — shifts, not comparisons
+ *   Map<string, number>         — TS generics
+ *   <div>…</div>                — JSX
+ * from producing mutants that are pure syntax errors, get falsely counted as
+ * KILLED, and inflate the mutation score.
  * @returns {{ start: number, end: number, op: typeof OPERATORS[number] }[]}
  */
 function findOperators(masked) {
@@ -155,6 +245,24 @@ function findOperators(masked) {
       }
     }
 
+    if (matched.kind === 'comparison') {
+      const before = masked.slice(0, i).trimEnd();
+      const after = masked.slice(i + matched.from.length).trimStart();
+      // An operand may start with a unary sign: `a > -1` is a real comparison.
+      const operandBefore = /[\w)\]'"`]$/.test(before);
+      const operandAfter = /^[\w(\['"`-]/.test(after);
+      if (!operandBefore || !operandAfter) {
+        i += 1;
+        continue;
+      }
+      // `=>` is an arrow function, not `=` followed by `>`: a `>` whose preceding
+      // non-space char is `=` is the arrow's head, never a comparison.
+      if (masked[i] === '>' && before.endsWith('=')) {
+        i += 1;
+        continue;
+      }
+    }
+
     found.push({ start: i, end: i + matched.from.length, op: matched });
     i += matched.from.length;
   }
@@ -162,7 +270,10 @@ function findOperators(masked) {
   return found;
 }
 
-/** End of an expression that starts at `start`: a `;` or an unmatched closer. */
+/**
+ * End of an expression that starts at `start`: a `;`, a comma at depth 0, or an
+ * unmatched closer.
+ */
 function expressionEnd(masked, start) {
   let depth = 0;
   for (let i = start; i < masked.length; i += 1) {
@@ -230,6 +341,11 @@ export function mutationsFor(source, fileLabel = 'source', options = {}) {
   const strict = profile === 'strict';
 
   const lines = source.split('\n');
+  // Masked ONCE for the whole file: string/template/comment/regex state must carry
+  // across newlines, or the continuation lines of a block comment or a template
+  // literal holding SQL look like live code and get mutated.
+  const maskedSource = maskCode(source);
+  const maskedLines = maskedSource.split('\n');
   /** @type {Mutation[]} */
   const out = [];
   let counter = 0;
@@ -238,7 +354,7 @@ export function mutationsFor(source, fileLabel = 'source', options = {}) {
     const raw = lines[idx];
     if (!raw.trim() || SKIP_LINE.test(raw)) continue;
 
-    const masked = maskLiterals(raw);
+    const masked = maskedLines[idx] ?? '';
     if (!masked.trim()) continue;
 
     const push = (kind, start, end, replacement, description) => {
@@ -249,6 +365,7 @@ export function mutationsFor(source, fileLabel = 'source', options = {}) {
         id: `${fileLabel}:${idx + 1}:${counter}`,
         kind,
         line: idx + 1,
+        column: start + 1,
         original,
         mutated: raw.slice(0, start) + replacement + raw.slice(end),
         description,
@@ -273,11 +390,17 @@ export function mutationsFor(source, fileLabel = 'source', options = {}) {
 
     // 1b. Ternary branch swap: `cond ? a : b` -> `cond ? b : a`.
     //     Catches a conditional nobody checks in both directions.
+    //     Skipped inside a template interpolation: maskCode blanks the closing `}`
+    //     of `${...}`, so the boundary check runs on the raw line instead. The
+    //     range is [question, end) — a `}` AT `end` is an object literal's own
+    //     brace, not an interpolation boundary; a `}` BEFORE `end` means it
+    //     truncated the else-branch.
     const ternary = findTernary(masked);
     if (ternary) {
       const thenPart = raw.slice(ternary.question + 1, ternary.colon).trim();
       const elsePart = raw.slice(ternary.colon + 1, ternary.end).trim();
-      if (thenPart && elsePart && thenPart !== elsePart) {
+      const crossesInterpolation = raw.slice(ternary.question, ternary.end).includes('}');
+      if (thenPart && elsePart && thenPart !== elsePart && !crossesInterpolation) {
         push('condition', ternary.question, ternary.end,
           `? ${elsePart} : ${thenPart}`, 'swap the ternary branches');
       }
@@ -343,7 +466,8 @@ export function mutationsFor(source, fileLabel = 'source', options = {}) {
 
     // 6. String literals in returns or comparisons: `'full'` -> `''`.
     //    Catches status strings that no test asserts.
-    //    A fresh regex per line: the shared one carries lastIndex between calls.
+    //    The masked line keeps quote delimiters (contents blanked), so scanning the
+    //    RAW line inside the delimiters is still correct here.
     const strings = /(['"])((?:\\.|(?!\1).)*)\1/g;
     let strMatch;
     while ((strMatch = strings.exec(raw)) !== null) {
@@ -389,3 +513,60 @@ export const operators = {
   statement: 'drops a returned value',
   string: 'empties a string literal',
 };
+
+/**
+ * Parse-check a JavaScript source text WITHOUT executing it, using `new Function`.
+ *
+ * `new Function(body)` compiles the body and throws only on SyntaxError; it never
+ * runs the code. This is the zero-dependency syntax gate for generated mutants:
+ * a mutant that cannot parse is a guaranteed test failure for reasons that have
+ * nothing to do with test quality, and counting it as KILLED inflates the score.
+ *
+ * Module syntax (import/export) is illegal in a FunctionBody, so it is stripped
+ * first; a plain expression is wrapped in a function body to be a legal script.
+ * Returns the parseable form, or null when the text cannot be parsed at all.
+ *
+ * @param {string} source
+ * @param {string|null} [file] file label used only to decide JS vs not-JS
+ * @returns {string|null}
+ */
+export function parsesAsScript(source, file = null) {
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  if (!Number.isFinite(nodeMajor)) return null;
+  if (nodeMajor < 20) return null;
+
+  // .mjs/.cjs/.js are JavaScript by definition. Anything else (TS, JSX, unknown,
+  // or no file hint) is skipped: a false "does not parse" would silently remove
+  // mutations from the audit.
+  let ext = null;
+  if (typeof file === 'string' && file.includes('.')) ext = file.slice(file.lastIndexOf('.')).toLowerCase();
+  if (!['.js', '.mjs', '.cjs'].includes(ext)) return null;
+
+  const body = source;
+  const candidates = [];
+
+  // Module syntax must be stripped before FunctionBody parsing. `export default`
+  // needs its own pattern: stripping just the `export` keyword leaves a bare
+  // `default function`, which is not legal script syntax.
+  if (/^\s*(import|export)\s/m.test(body)) {
+    candidates.push(
+      body.replace(/^\s*import[^\n]*\n?/gm, '\n')
+        .replace(/^\s*export\s+default\s+/gm, '')
+        .replace(/^\s*export\s+/gm, ''),
+    );
+  }
+  // A plain expression needs a script wrapper to parse.
+  if (!/^\s*(?:function|class|if|for|while|const|let|var|async|\/\*)/m.test(body)) {
+    candidates.push(`(0, function(){\n${body}\n})`);
+  }
+  candidates.push(body);
+
+  for (const candidate of candidates) {
+    try {
+      // eslint-disable-next-line no-new-func
+      new Function(candidate); // throws only on SyntaxError, never executes
+      return candidate;
+    } catch { /* try the next wrapping */ }
+  }
+  return null;
+}

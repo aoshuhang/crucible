@@ -22,12 +22,36 @@ import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 /**
  * Bump when `mutationsFor`, `selectMutations` or the judging rules change: an old
  * entry would otherwise claim a score the current version would not produce.
  */
 const CACHE_VERSION = 1;
+
+/**
+ * The published package version, mixed into every cache key.
+ *
+ * 0.2.0 changed the judging rules substantially while CACHE_VERSION stayed at 1,
+ * so entries written by 0.1.x were reused and reported 0.1.x scores as if they
+ * were this version's findings. The format version alone cannot catch that: it
+ * only changes when someone remembers to bump it. The package version changes
+ * every release by construction.
+ *
+ * Falls back to 'unknown' when package.json is not next to this module (a
+ * checkout layout change, an install without files): keys still differ from any
+ * known version, so nothing stale is ever reused.
+ */
+function packageVersion() {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    return JSON.parse(readFileSync(pkgPath, 'utf8')).version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
 
 /** Upper bound on stored entries; oldest entries are dropped first. */
 const MAX_ENTRIES = 1000;
@@ -44,6 +68,7 @@ export function cacheFileFor(root) {
 export function cacheKey({ source, testContents = [], command, profile, maxMutations }) {
   const hash = createHash('sha256');
   hash.update(`v${CACHE_VERSION}\0`);
+  hash.update(`${packageVersion()}\0`);
   hash.update(`${profile}\0${maxMutations}\0${command}\0`);
   hash.update(source);
   for (const text of testContents) {
@@ -60,7 +85,12 @@ export async function loadCache(root, { enabled = true } = {}) {
   const file = cacheFileFor(root);
   try {
     const parsed = JSON.parse(await readFile(file, 'utf8'));
-    if (parsed?.version !== CACHE_VERSION || typeof parsed.entries !== 'object' || parsed.entries === null) {
+    // The stored format version AND the package version must both match: keys
+    // from a different release never hit anyway, but this check keeps the file
+    // honest about what wrote it.
+    if (parsed?.version !== CACHE_VERSION
+      || parsed?.packageVersion !== packageVersion()
+      || typeof parsed.entries !== 'object' || parsed.entries === null) {
       return { file, entries: {} };
     }
     return { file, entries: parsed.entries };
@@ -81,7 +111,11 @@ export async function saveCache(cache) {
   }
   try {
     await mkdir(dirname(cache.file), { recursive: true });
-    await writeFile(cache.file, JSON.stringify({ version: CACHE_VERSION, entries: cache.entries }), 'utf8');
+    await writeFile(cache.file, JSON.stringify({
+      version: CACHE_VERSION,
+      packageVersion: packageVersion(),
+      entries: cache.entries,
+    }), 'utf8');
   } catch { /* optimisation only */ }
 }
 

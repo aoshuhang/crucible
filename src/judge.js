@@ -14,7 +14,7 @@ import { exec } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { rmSync, writeFileSync } from 'node:fs';
 import { mutationsFor, applyMutation } from './mutate.js';
-import { relPosix, baseName } from './paths.js';
+import { relPosix, baseName, shQuote } from './paths.js';
 
 /**
  * Files whose original bytes are currently overwritten on disk, and temporary
@@ -74,6 +74,10 @@ export function cleanupTempFilesSync() {
  *
  * Synchronous on purpose: signal handlers and the `exit` event cannot await an
  * async write. Returns how many files were restored, for the caller's message.
+ *
+ * A restore that fails is recorded (see recordRestoreFailure) and the original
+ * content is written to `<file>.crucible-backup`, so the failure is never silent
+ * and the user's code is never lost.
  */
 export function restoreInFlightSync() {
   let restored = 0;
@@ -81,7 +85,12 @@ export function restoreInFlightSync() {
     try {
       writeFileSync(file, original, 'utf8');
       restored += 1;
-    } catch { /* best effort — the original is also in the caller's memory */ }
+    } catch (error) {
+      recordRestoreFailure({ file, code: error?.code, message: error?.message });
+      try {
+        writeFileSync(`${file}.crucible-backup`, original, 'utf8');
+      } catch { /* nothing more we can do; the CLI still reports the failure */ }
+    }
   }
   inFlight.clear();
   return restored;
@@ -157,7 +166,7 @@ export function narrowCommand({ command, testFiles, root }) {
   // usually a shared utility, so the whole suite is the honest choice.
   if (rels.length > 40) return base;
 
-  const quoted = rels.map((r) => JSON.stringify(r)).join(' ');
+  const quoted = rels.map((r) => shQuote(r)).join(' ');
 
   if (/node_modules\/\.bin\/vitest|vitest run/.test(command)) {
     return addFailFast(`./node_modules/.bin/vitest run ${quoted}`);
@@ -213,7 +222,7 @@ export function narrowCommand({ command, testFiles, root }) {
       return cut === -1 ? '.' : rel.slice(0, cut);
     }))];
     if (dirs.length <= 40) {
-      const targets = dirs.map((dir) => JSON.stringify(dir === '.' ? '.' : `./${dir}`)).join(' ');
+      const targets = dirs.map((dir) => shQuote(dir === '.' ? '.' : `./${dir}`)).join(' ');
       return `go test -failfast ${targets}`;
     }
     return base;
@@ -225,7 +234,7 @@ export function narrowCommand({ command, testFiles, root }) {
     const inTests = rels.filter((rel) => rel.startsWith('tests/'));
     const targets = [...new Set(inTests.map((rel) => rel.slice('tests/'.length).replace(/\.[^.]+$/, '')))];
     if (targets.length > 0 && targets.length === rels.length && targets.length <= 20) {
-      return targets.map((name) => `cargo test --test ${JSON.stringify(name)}`).join(' && ');
+      return targets.map((name) => `cargo test --test ${shQuote(name)}`).join(' && ');
     }
     return base;
   }
@@ -309,17 +318,80 @@ export async function judgeMutation({ root, file, command, mutation, timeoutMs =
 
     if (result.timedOut) return { verdict: 'ERRORED', reason: 'timeout', ms: result.ms };
 
+    if (!result.ok && looksLikeSyntaxError(result.stdout + result.stderr)) {
+      // The mutation broke the file's syntax, so nothing about test quality was
+      // measured: the red suite is about the mutant, not the tests. Counting it
+      // as KILLED inflates the score with free kills the suite never earned.
+      return { verdict: 'ERRORED', reason: 'the mutation broke the file syntax', ms: result.ms };
+    }
+
     return {
       verdict: result.ok ? 'SURVIVED' : 'KILLED',
       ms: result.ms,
       output: result.ok ? '' : (result.stdout + result.stderr).slice(-2000),
     };
   } finally {
-    // Restore even when the run threw. A crashed run must never leave the user's
-    // working tree modified.
-    await writeFile(file, original, 'utf8').catch(() => {});
-    clearInFlight(file);
+    // Restore even when the run threw. A restore that fails must be LOUD: write
+    // the original to a backup and record the failure so the CLI can report it
+    // and fail the run. Silently swallowing it once left a user's file
+    // permanently mutated with exit code 0.
+    try {
+      await writeFile(file, original, 'utf8');
+      clearInFlight(file);
+    } catch (error) {
+      clearInFlight(file);
+      try {
+        writeFileSync(`${file}.crucible-backup`, original, 'utf8');
+      } catch { /* nothing more we can do; the CLI still reports the failure */ }
+      recordRestoreFailure({ file, code: error?.code, message: error?.message });
+    }
   }
+}
+
+/** Restore failures seen in this process, reported loudly at exit by the CLI. */
+const restoreFailuresReport = [];
+
+/** Register a restore failure so `scan`/`fix` can fail the run with the truth. */
+export function recordRestoreFailure(entry) {
+  if (!restoreFailuresReport.some((e) => e.file === entry.file)) restoreFailuresReport.push(entry);
+}
+
+/** All restore failures seen so far in this process. */
+export function restoreFailuresSeen() {
+  return [...restoreFailuresReport];
+}
+
+/**
+ * Does a failed run look like a parse/compile failure rather than a test failure?
+ *
+ * A mutant that is a syntax error makes the runner fail before any test runs.
+ * That red is about the mutant, not the suite, and counting it as KILLED gave
+ * fake tests a head start: on a suite with zero assertions the score was 18%
+ * purely from mutants that could not parse.
+ *
+ * Every runner spells the error differently, so each rule has TWO anchors:
+ * a line start (optionally indented, which also covers pytest's `E   ` prefix)
+ * or a file-location prefix (`src/a.ts:5:12 - ...`), the way tsc and swiftc
+ * report. A test whose assertion message merely mentions "SyntaxError" — a
+ * parser project asserting that bad input throws — matches neither anchor, so
+ * a genuine KILLED verdict is not stolen by this classifier.
+ */
+export function looksLikeSyntaxError(output) {
+  const text = String(output);
+  // Anchor A: start of a line, optionally indented and/or behind pytest's `E   `
+  // failure marker. Anchor B: right after a file location the way tsc
+  // (`src/a.ts:5:12 - error TS1005`), swiftc (`a.swift:3:13: error:`) and go
+  // (`a.go:3:5: syntax error:`) report. An assertion message that merely
+  // mentions an error name matches neither anchor, because runners always
+  // prefix it (`AssertionError:`, `Error:`, `- expected ...`).
+  const at = String.raw`(?:(?:^|\n)\s*(?:E[ \t]+)?|(?:^|\n)[^\n]*?:\d+:\d+[\s:-]*)`;
+  if (new RegExp(String.raw`${at}SyntaxError:`).test(text)) return true; // node, jest, pytest
+  if (new RegExp(String.raw`${at}error TS1\d{3}`).test(text)) return true; // tsc
+  if (new RegExp(String.raw`${at}error:`).test(text)) return true; // rustc/swiftc, lowercase only: JS failures print `Error:`
+  if (new RegExp(String.raw`${at}(?:Unexpected token|Unexpected end of input|Unexpected identifier|Unexpected character|missing \) after argument list)`).test(text)) return true; // V8, babel
+  if (/(?:^|\n)[^\n]{0,4}\[ERROR\]/.test(text)) return true; // esbuild: `✘ [ERROR] Expected ";" but found "x"`
+  if (new RegExp(`${at}(?:Failed to parse|ParseError:|expected expression|expected one of|syntax error)`, 'i').test(text)) return true; // pytest prelude, esbuild ParseError, go
+  return false;
 }
 
 /**

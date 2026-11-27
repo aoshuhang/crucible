@@ -3,6 +3,84 @@
 All notable changes to crucible. Versions follow semver; anything before 1.0 may
 still change behaviour in a minor release.
 
+## 0.3.0 — 2026-11-27
+
+Score honesty, agent-visible results, and loud failures. Every fix below was
+found by adversarial probing of the tool itself and has a regression test.
+
+### Fixed — the score can no longer be inflated
+
+- Syntax-broken mutants are no longer counted as killed. The line-based operator
+  scanner used to read `x => x * 2` as `=` + `>` and emit `x =>= x * 2`, TS
+  generics and JSX angle brackets as comparisons, and shifts (`x << 2`) as
+  `<<` + a stray `>`. Those mutants fail to parse, the suite goes red for
+  reasons unrelated to test quality, and the run was counted as KILLED. On a
+  suite with zero assertions this alone produced a score of 18%. Fixes:
+  - comparison operators now require operand-shaped text on both sides (arrow
+    heads, generics, shifts and JSX no longer match);
+  - the masker runs over the whole file, so the continuation lines of block
+    comments and template literals (SQL in a backtick string) are never mutated;
+  - regex literals (`/-/g`) are recognised and never read as division;
+  - plain-JS mutants are parse-checked with `new Function` (compile-only) before
+    they are scheduled; TS files keep the runtime classification;
+  - a failed run whose output looks like a parse error (`SyntaxError`, …) is
+    classified ERRORED, not KILLED, for every runner.
+- A zero-assertion suite now scores 0. This is the headline honesty property.
+- The mutation score no longer claims files it did not audit: `--limit` runs
+  state the limit and the number of covered files that were left out, in both
+  the human report (`N covered files were not audited (over --limit=12)`) and
+  the JSON (`limit`, `notAudited`).
+
+### Fixed — survivors are visible again
+
+- Every surviving mutation is now a finding. Non-boundary survivors (arithmetic
+  flips, emptied strings, dropped returns) used to vanish from the report: a
+  suite whose only gap was `*` → `/` showed zero findings, exit 0, and a JSON
+  `findings` array an agent had no reason to distrust. They are graded
+  `suspect` — real gaps most of the time, possibly equivalent mutants — so they
+  never drive the headline count or the exit code.
+- The JSON per-file entries now carry a `survivors` list (line, column, kind,
+  description) so an agent can act without re-running anything.
+- Boundary findings carry a `column`; two comparisons on one line are two
+  findings with distinct descriptions (`count >= MAX` vs `weight >= 5`) instead
+  of one collapsed duplicate.
+
+### Fixed — safety
+
+- A file that could not be restored after mutation is now reported on every exit
+  path (signal, normal exit, crash), the original content is written next to it
+  as `<file>.crucible-backup`, and the run exits 2. Previously the restore
+  failure was swallowed (`.catch(() => {})`), the user's file was left mutated,
+  and the process exited 0.
+- Sandbox validation runs the suite in ONE copy instead of N: the copies are
+  byte-identical and share the linked `node_modules`, so N-1 of those runs
+  proved nothing and cost minutes on slow suites.
+
+### Fixed — interface
+
+- `fix --json` prints a machine-readable report. It used to print nothing at
+  all — every message went through the human-only `say()` — while the README
+  promised JSON for every command.
+- Shell quoting uses single quotes (`shQuote`). `JSON.stringify` produces double
+  quotes, inside which the shell still expands `$(…)` and backticks; a test file
+  named `$(touch pwned).test.js` would have executed its name.
+- The results cache key includes the package version. 0.2.0 changed the judging
+  rules while the cache format version stayed at 1, so 0.1.x entries were reused
+  and reported old scores as current findings.
+- A ternary inside a template interpolation (`` `${cond ? a : b}` ``) is no
+  longer branch-swapped: the swap moved code outside the `${…}` and produced a
+  guaranteed syntax error.
+
+### Added
+
+- `.vue` and `.svelte` files are no longer "unsupported": their `<script>` block
+  is read by `check`, so tests inside single-file components are analysed. They
+  are still not mutated, and the report says which files were read.
+- Weekly CI job (`real-projects.yml`) runs `check` against axios, express,
+  lodash, p-map, chalk and slugify and fails when any "certain" finding appears
+  on a healthy project — the false-positive guarantee, guarded continuously
+  instead of manually.
+
 ## 0.2.0 — 2026-11-27
 
 Correctness, safety and speed.

@@ -16,13 +16,42 @@ import { readFile, rm, cp, mkdtemp, symlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mutationsFor } from './mutate.js';
+import { mutationsFor, parsesAsScript } from './mutate.js';
 import { selectMutations, judgeMutation, narrowCommand, run } from './judge.js';
 import { registerSandbox, unregisterSandbox } from './judge.js';
 import { relPosix, baseName } from './paths.js';
 
 /** Never copied into a sandbox: dependencies are linked, history is irrelevant. */
 const SANDBOX_SKIP = new Set(['node_modules', '.git', '.DS_Store']);
+
+/**
+ * Drop mutations whose mutant cannot parse as JavaScript, before scheduling.
+ *
+ * A syntax-broken mutant makes the runner fail before any test runs, which reads
+ * as KILLED — a kill the suite never earned. On a suite with zero assertions
+ * this alone produced an 18% score. Plain JS/TS-less files are gated with
+ * `new Function` (compile only, never execute); TypeScript and friends keep the
+ * runtime check in `judgeMutation` (SyntaxError classification), which cannot
+ * be done statically without a TS parser.
+ */
+function syntacticallyValid(source, file, mutations) {
+  const probe = parsesAsScript(source, file);
+  if (probe === null) return mutations;
+  return mutations.filter((mutation) => {
+    // Rebuild the mutated file text the same way applyMutation does.
+    const lines = source.split('\n');
+    lines[mutation.line - 1] = mutation.mutated;
+    const candidate = lines.join('\n');
+    for (const form of [candidate, candidate.replace(/^\s*import[^\n]*\n?/gm, '\n').replace(/^\s*export\s+default\s+/gm, '').replace(/^\s*export\s+/gm, '')]) {
+      try {
+        // eslint-disable-next-line no-new-func
+        new Function(form); // throws only on SyntaxError, never executes
+        return true;
+      } catch { /* try the stripped form */ }
+    }
+    return false;
+  });
+}
 
 /**
  * Choose the mutations for every file up front.
@@ -32,19 +61,25 @@ const SANDBOX_SKIP = new Set(['node_modules', '.git', '.DS_Store']);
  */
 export async function buildPlan({ root, targets, command, profile = 'logic', maxMutations = 12 }) {
   const plan = [];
+  let droppedForSyntax = 0;
   for (const target of targets) {
     const source = await readFile(target.file, 'utf8');
     const all = mutationsFor(source, target.file, { profile });
-    const picked = selectMutations(all, maxMutations);
+    const gated = syntacticallyValid(source, target.file, all);
+    droppedForSyntax += all.length - gated.length;
+    const picked = selectMutations(gated, maxMutations);
     plan.push({
       file: target.file,
       testFiles: target.testFiles,
       source,
-      all,
+      all: gated,
       picked,
       effective: narrowCommand({ command, testFiles: target.testFiles, root }),
       results: new Map(),
     });
+  }
+  if (droppedForSyntax > 0) {
+    plan.droppedForSyntax = droppedForSyntax;
   }
   return plan;
 }
@@ -148,18 +183,23 @@ export function finalizePlan(plan) {
 /**
  * Create and validate sandbox copies. Returns [] when sandboxing is not viable, and
  * the caller falls back to the sequential in-place path.
+ *
+ * Validation runs the suite in ONE copy only: the copies are byte-identical and
+ * share the same node_modules link, so a second run proves nothing the first did
+ * not. The per-copy check used to re-run the full suite N times, which on a slow
+ * suite cost minutes of pure duplication before any mutant was judged.
  */
 async function trySandboxes({ root, count, command }) {
   const made = [];
   try {
     for (let i = 0; i < count; i += 1) made.push(await createSandbox(root));
 
-    // Each copy must be able to run the full suite before any mutant result from it
-    // can be believed. A suite that is red in the copy would report every mutation as
+    // One copy must run the suite green before any mutant result from any copy can
+    // be believed. A suite that is red in the copies would report every mutation as
     // killed, which reads as a flawless test suite.
     if (command) {
-      const checks = await Promise.all(made.map((s) => run(command, s.dir, 180_000)));
-      if (!checks.every((c) => c.ok)) throw new Error('a sandbox copy could not run the suite');
+      const check = await run(command, made[0].dir, 180_000);
+      if (!check.ok) throw new Error('a sandbox copy could not run the suite');
     }
     return made;
   } catch {

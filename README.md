@@ -235,8 +235,8 @@ PR. `fix` is what you run when `scan` finds something.
 
 | flag | applies to | effect |
 |---|---|---|
-| `--json` | all | machine-readable output, including a `next` block per finding |
-| `--limit=N` | scan, fix | audit at most N source files (default 12) |
+| `--json` | all | machine-readable output, including a `next` block per finding and a `survivors` list per file |
+| `--limit=N` | scan, fix | audit at most N source files (default 12); files left out are named in the report |
 | `--jobs=N` | scan | parallel sandbox workers (default `min(4, cpus)`; `1` mutates in place) |
 | `--no-cache` | scan | ignore the incremental results cache |
 | `--fail-under=N` | scan | exit 1 when the mutation score is below N percent |
@@ -291,8 +291,10 @@ runner installed itself. `scan` detects npm/yarn workspaces and
 `pnpm-workspace.yaml`, and prints the package directories to run against instead of
 blaming the runner. Run `crucible scan packages/web` per package for full coverage.
 
-**Formats it cannot parse.** `.vue`, `.svelte`, `.astro`, Ruby, PHP and similar
-files are counted and reported as skipped. They are not silently treated as clean.
+**Formats it cannot parse.** `.astro`, Ruby, PHP and similar files are counted
+and reported as skipped. They are not silently treated as clean. `.vue` and
+`.svelte` are different: their `<script>` block IS JavaScript, so `check` reads
+it and reports findings inside it; `scan` still cannot mutate them.
 
 If the test command cannot be determined from `package.json` or a known config
 file, crucible refuses rather than guessing a glob. A guessed glob matches nothing,
@@ -302,11 +304,14 @@ a healthy project.
 ## Safety
 
 `crucible` modifies your source files to run each mutation, and restores each one in
-a `finally` block. Two guarantees:
+a `finally` block. Guarantees:
 
 - It refuses to run if your suite is already failing, because every result would be
   meaningless.
 - It refuses to write a fix if the suite goes red afterwards.
+- If a restore ever fails (disk full, permissions changed mid-run), the run exits 2,
+  the failure is printed, and the original content is written next to the file as
+  `<file>.crucible-backup`. A restore failure is never silent.
 
 Run it on a clean working tree anyway — that is what git is for.
 

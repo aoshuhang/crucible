@@ -32,5 +32,8 @@ jobs:
       - name: unit and end-to-end tests
         run: npm test
 
+      - name: selftest (CLI over the fixture project)
+        run: npm run selftest
+
       - name: the CLI starts and reports its environment
         run: node bin/crucible.js --version

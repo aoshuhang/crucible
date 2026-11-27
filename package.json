@@ -1,6 +1,6 @@
 {
   "name": "@hsaohuang/crucible",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Find AI-generated tests that assert nothing, then rewrite them until they actually catch bugs.",
   "type": "module",
   "bin": {
@@ -18,7 +18,7 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1",
-    "selftest": "node bin/crucible.js scan test/fixtures/project --json"
+    "selftest": "node bin/crucible.js scan test/fixtures/project --json | node bin/selftest.js"
   },
   "keywords": [
     "testing",

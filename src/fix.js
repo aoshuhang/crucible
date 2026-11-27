@@ -17,6 +17,7 @@
 
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { join, dirname, basename, extname, relative } from 'node:path';
+import { NEIGHBOUR_OPERATOR } from './paths.js';
 
 /** Functions exported by a source file, best effort. */
 export function exportedNames(source) {
@@ -349,12 +350,10 @@ export function buildBoundaryProbe({ importPath, cases }) {
  */
 export function suggestManualBoundary({ fn, comparison, sourceLines }) {
   const line = sourceLines[comparison.line - 1] ?? '';
-  const flipped = { '<': '<=', '<=': '<', '>': '>=', '>=': '>', '===': '!==', '!==': '===', '==': '!=', '!=': '==' };
-
   const left = comparison.left;
   const right = comparison.right;
   const current = comparison.op;
-  const other = flipped[current] ?? current;
+  const other = NEIGHBOUR_OPERATOR[current] ?? current;
 
   return {
     fn,

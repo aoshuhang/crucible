@@ -11,6 +11,9 @@
  * instead of the useless "your tests are weak".
  */
 
+import { NEIGHBOUR_OPERATOR } from './paths.js';
+
+
 /** Comparison operators and what their boundary is. */
 const COMPARISONS = new Set(['===', '!==', '==', '!=', '>=', '<=', '>', '<']);
 
@@ -69,19 +72,29 @@ export function isThresholdLiteral(mutation, sourceLines) {
 /**
  * Extract the surrounding expression so the report can show what is untested,
  * e.g. `threat.distance <= p.sightRange` rather than just `<=`.
+ *
+ * `mutation.column` (1-based) pins the exact operator occurrence; without it, a
+ * line like `if (count >= MAX && weight >= 5)` produced the SAME description for
+ * both survivors, and the location dedup collapsed them into one finding.
  */
 export function describeBoundary(mutation, sourceLines) {
   const line = sourceLines[mutation.line - 1] ?? '';
   const trimmed = line.trim();
 
   if (mutation.kind === 'comparison') {
-    // Try to capture `a OP b` around the operator.
-    const idx = line.indexOf(mutation.original, Math.max(0, line.indexOf(trimmed)));
+    // Prefer the column the mutation was generated from; fall back to the first
+    // occurrence for callers that hand-build a mutation object (older tests).
+    let idx = typeof mutation.column === 'number' ? mutation.column - 1 : -1;
+    if (idx === -1 || line.slice(idx, idx + mutation.original.length) !== mutation.original) {
+      idx = line.indexOf(mutation.original, Math.max(0, line.indexOf(trimmed)));
+    }
     if (idx !== -1) {
       const before = line.slice(0, idx);
       const after = line.slice(idx + mutation.original.length);
+      // A negative number is a valid right operand: `a > -1` must describe as
+      // `a > -1`, not fall back to the whole line.
       const left = (before.match(/[\w.$\[\]'"]+(?:\([^)]*\))?\s*$/) ?? [''])[0].trim();
-      const right = (after.match(/^\s*[\w.$\[\]'"]+(?:\([^)]*\))?/) ?? [''])[0].trim();
+      const right = (after.match(/^\s*-?[\w.$\[\]'"]+(?:\([^)]*\))?/) ?? [''])[0].trim();
       if (left && right) return `${left} ${mutation.original} ${right}`;
     }
   }
@@ -102,8 +115,7 @@ export function describeBoundary(mutation, sourceLines) {
  */
 export function suggestBoundaryTest(mutation, described) {
   if (mutation.kind === 'comparison') {
-    const flipped = { '<': '<=', '<=': '<', '>': '>=', '>=': '>', '===': '!==', '!==': '===', '==': '!=', '!=': '==' };
-    const eq = flipped[mutation.original];
+    const eq = NEIGHBOUR_OPERATOR[mutation.original];
     return `Add a case where both sides are equal: the ${mutation.original} and ${eq} versions differ only at that point.`;
   }
 

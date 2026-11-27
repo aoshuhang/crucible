@@ -14,7 +14,7 @@ import { comparisonsIn, boundaryValues, boundarySensitive } from './boundary-val
 import { exportedNames, buildBoundaryTest, buildBoundaryProbe, parseProbeOutput, placement, suggestManualBoundary } from './fix.js';
 import { run, addFailFast, registerTempFile, unregisterTempFile } from './judge.js';
 import { mayWrite, stamp } from './guard.js';
-import { stem, relPosix } from './paths.js';
+import { stem, relPosix, shQuote } from './paths.js';
 
 /**
  * Read the real return values at the boundary.
@@ -31,16 +31,16 @@ async function probeValues({ root, sourceFile, probePath, runnerName, fullComman
   const plainJs = ext === '.js' || ext === '.mjs' || ext === '.cjs';
 
   if (plainJs) {
-    const result = await run(`node ${JSON.stringify(probePath)}`, root, 60_000);
+    const result = await run(`node ${shQuote(probePath)}`, root, 60_000);
     return parseProbeOutput(result.stdout + result.stderr);
   }
 
   const rel = relPosix(root, probePath);
   const narrow = runnerName === 'vitest'
-    ? `./node_modules/.bin/vitest run ${JSON.stringify(rel)}`
+    ? `./node_modules/.bin/vitest run ${shQuote(rel)}`
     : runnerName === 'jest'
-      ? `./node_modules/.bin/jest ${JSON.stringify(rel)} --ci`
-      : `node --test ${JSON.stringify(rel)}`;
+      ? `./node_modules/.bin/jest ${shQuote(rel)} --ci`
+      : `node --test ${shQuote(rel)}`;
 
   const narrowRun = await run(narrow, root, 120_000);
   const parsed = parseProbeOutput(narrowRun.stdout + narrowRun.stderr);
@@ -251,7 +251,7 @@ export async function fixBoundaries(options) {
       const pyProbe = buildPythonProbe({ importPath, cases });
       await writeFile(probePath, pyProbe, 'utf8');
 
-      const pyRun = await run(`python3 ${JSON.stringify(probePath)}`, root, 60_000);
+      const pyRun = await run(`python3 ${shQuote(probePath)}`, root, 60_000);
 
       let probed = null;
       const marker = 'CRUCIBLE_PROBE';
