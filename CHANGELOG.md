@@ -3,6 +3,123 @@
 All notable changes to crucible. Versions follow semver; anything before 1.0 may
 still change behaviour in a minor release.
 
+## 0.4.0 — 2026-11-28
+
+Trustworthy results: real parsers, verified repairs and honest scores.
+
+### Fixed after auditing large real projects
+
+Real-project runs covered axios, Express, Lodash, NestJS, Flask, Gin, Vue, Django,
+Click, FastAPI, Zod, React, SQLAlchemy and a Next.js snapshot. These findings
+changed the tool:
+
+- Python test discovery no longer treats a Flask route handler named
+  `def test_index()` inside a test as a pytest test. Python masking now handles
+  triple-quoted docstrings and preserves UTF-16 indices for emoji; Django findings
+  were previously shifted by 100 lines after an emoji string.
+- Django helper classes named `test_func()` and pytest collection rules are
+  respected: only top-level classes that look like TestCase/Test containers are
+  scanned. Assertions delegated via `self._test_*`, `super().test_*`, local
+  helpers and custom decorators are recognised. Module-level `test_*` helpers in
+  unittest/Django files are not treated as pytest tests, and a unittest class
+  method with no direct assertion is `suspect` because it may rely on setUp or a
+  base class. FastAPI tutorial wrapper tests that call an imported `test_*` helper
+  are recognised as delegated assertions; explicit `Just for coverage` calls are
+  classified as smoke tests.
+- A `.rejects`/`.resolves` assertion assigned to a variable and awaited later is
+  no longer reported as un-awaited.
+- `@ts-expect-error`, `satisfies`, `expectTypeOf` and `assertType` count as
+  TypeScript compile-time assertions.
+- A test that only calls a validation method such as `parse`, `safeParse` or
+  `validate` to verify success is a smoke test (`suspect`), not a certain fake
+  test. Zod contained dozens of such legitimate cases.
+- `mock-self` only fires for the unambiguous case: the test imports exactly one
+  local module and mocks that module. Mocking one of several local modules, or an
+  external package, is a collaborator mock.
+- Tests whose name/comment explicitly says "does not throw/error/warn" are smoke
+  tests, not certain fake tests. Imported assertion helpers (`expectMarkupMismatch`,
+  `expectConsoleErrorDev`, SQLAlchemy's `eq_`/`is_`), `beforeEach` local helpers,
+  JSX expression-bodied tests and `@gate`/`testFn` test-factory semantics are
+  recognised.
+- A multi-line Python decorator block (`@testing.skip_if(...)`) is considered when
+  deciding whether a test is skipped.
+- Intentionally skipped tests are `suspect`, not `certain`; they remain visible
+  but no longer fail a CI gate. A placeholder inside `describe.skip` is not also
+  reported as no-assertion.
+- Coverage follows transitive internal imports and package/barrel entries
+  (`require('../')`, `from flask import ...`, workspace packages).
+- All non-test `.go` files in a package count as covered by that package's tests.
+- Test support, examples, sample apps, integration fixtures, benchmarks, docs,
+  `docs_src` tutorials and tool configs are excluded from product-source
+  candidates.
+- `--limit=N` counts files with actual mutation candidates, so a re-export-only
+  `index.js` cannot consume the only slot. `fix` follows the same rule.
+- `fix --json` reports per-file `skipped[]` reasons and returns a `review` next
+  step when no automatic repair was written; it no longer says "nothing to fix"
+  when the real limitation is CommonJS or an unobservable edge.
+- Go mutation skips files excluded by the current `//go:build` expression, so a
+  file such as Gin's `binding_nomsgpack.go` cannot produce phantom survivors.
+- Host-platform guards (`os.name == "nt"`, `sys.platform`, `process.platform`,
+  `typeof window`, ...) are not promoted to business boundaries. Their survivors
+  remain `suspect`, but a macOS run no longer calls an unreachable Windows branch
+  a likely untested edge.
+- A Go module download timeout (`go: downloading` + `i/o timeout`/proxy error) is
+  classified as missing dependencies with a GOPROXY hint, not as a red test suite.
+
+### Fixed — mutation correctness
+
+- JS/TS/JSX now mutate real AST nodes via `@babel/parser`. A quoted word in a
+  trailing comment can no longer produce a guaranteed survivor, and every
+  selected mutant is parsed before it is run.
+- Python mutation uses the interpreter's `ast`/`tokenize` through
+  `src/python_ast.py`; comparisons, `and`/`or`/`not`, booleans, returns, numbers
+  and strings are mutated without touching comments, docstrings or imports.
+- Narrowed vitest/jest/ava commands preserve `--config`, `--environment` and every
+  other project flag instead of rebuilding a stripped command. Unknown flags fall
+  back to the full command rather than guessing. Go/Cargo nesting preserves
+  `-race`, build tags, features and package flags.
+- Python `--profile=strict` reaches the AST helper; it previously always used the
+  logic profile.
+- A source file that cannot be parsed is reported as unaudited, with the parser
+  error, rather than looking clean.
+- Large-file mutation avoids an O(n²) line-index rebuild.
+
+### Fixed — repairs are verified, not assumed
+
+- Every generated test must parse and contain at least one assertion before it is
+  written. Object-valued boundaries now get a deep assertion; they used to become
+  comment-only tests.
+- Titles, imports and values containing apostrophes/quotes are escaped. Python
+  boundary cases require three representable observations with distinct
+  outcomes, and generated function names are unique. Two boundaries in the same
+  JavaScript function now get distinct output files instead of overwriting.
+- `fix` replays each generated boundary's target mutation after the suite goes
+  green. JSON and human output classify repairs as `repaired`, `partial`,
+  `ineffective` or `unverified`; only a killed target counts.
+- Unresolvable numeric edges are printed as manual work instead of being silently
+  omitted.
+
+### Fixed — honest coverage and cache
+
+- Test-to-source coverage now uses AST imports, `tsconfig`/`jsconfig` path
+  aliases and workspace package names. Python `src/` layouts and Rust
+  `tests/*.rs` integration tests resolve correctly.
+- Basename-only mentions are reported as unverified hints and never drive the
+  mutation score; comments and fixture strings no longer look like coverage.
+- The cache is invalidated by every source/test in the project, lockfiles,
+  tsconfig, runner config, Node version and platform, so a changed indirect
+  dependency cannot re-use a stale score.
+
+### Fixed — score scope
+
+- Scores carry `scoreKind: "complete" | "sampled"` and a `sampling` block with
+  files and mutant counts.
+- `--limit=all`, `--mutations=all` and `--select=files|changed|risk|all` support
+  explicit complete audits and useful partial priorities.
+- `--fail-under` messages state when a passing or failing gate only covered a
+  sample. Numeric threshold survivors use the honest `untested-threshold` id and
+  report the real change (`bump 5 to 6`) instead of a comparison flip.
+
 ## 0.3.0 — 2026-11-27
 
 Score honesty, agent-visible results, and loud failures. Every fix below was

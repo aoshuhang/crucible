@@ -16,7 +16,7 @@ import { readFile, rm, cp, mkdtemp, symlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mutationsFor, parsesAsScript } from './mutate.js';
+import { mutationsFor, mutationsDetailed, parsesAsScript } from './mutate.js';
 import { selectMutations, judgeMutation, narrowCommand, run } from './judge.js';
 import { registerSandbox, unregisterSandbox } from './judge.js';
 import { relPosix, baseName } from './paths.js';
@@ -29,27 +29,18 @@ const SANDBOX_SKIP = new Set(['node_modules', '.git', '.DS_Store']);
  *
  * A syntax-broken mutant makes the runner fail before any test runs, which reads
  * as KILLED — a kill the suite never earned. On a suite with zero assertions
- * this alone produced an 18% score. Plain JS/TS-less files are gated with
- * `new Function` (compile only, never execute); TypeScript and friends keep the
- * runtime check in `judgeMutation` (SyntaxError classification), which cannot
- * be done statically without a TS parser.
+ * this alone produced an 18% score. JS/TS/JSX now use the Babel parser; Python
+ * candidates are already AST-parse-checked by the helper. Languages without a
+ * parser keep the runtime SyntaxError classification in `judgeMutation`.
  */
 function syntacticallyValid(source, file, mutations) {
   const probe = parsesAsScript(source, file);
   if (probe === null) return mutations;
+  const lines = source.split('\n');
   return mutations.filter((mutation) => {
-    // Rebuild the mutated file text the same way applyMutation does.
-    const lines = source.split('\n');
-    lines[mutation.line - 1] = mutation.mutated;
-    const candidate = lines.join('\n');
-    for (const form of [candidate, candidate.replace(/^\s*import[^\n]*\n?/gm, '\n').replace(/^\s*export\s+default\s+/gm, '').replace(/^\s*export\s+/gm, '')]) {
-      try {
-        // eslint-disable-next-line no-new-func
-        new Function(form); // throws only on SyntaxError, never executes
-        return true;
-      } catch { /* try the stripped form */ }
-    }
-    return false;
+    const candidateLines = [...lines];
+    candidateLines[mutation.line - 1] = mutation.mutated;
+    return parsesAsScript(candidateLines.join('\n'), file) !== null;
   });
 }
 
@@ -63,16 +54,21 @@ export async function buildPlan({ root, targets, command, profile = 'logic', max
   const plan = [];
   let droppedForSyntax = 0;
   for (const target of targets) {
-    const source = await readFile(target.file, 'utf8');
-    const all = mutationsFor(source, target.file, { profile });
-    const gated = syntacticallyValid(source, target.file, all);
-    droppedForSyntax += all.length - gated.length;
-    const picked = selectMutations(gated, maxMutations);
+    const source = target.source ?? await readFile(target.file, 'utf8');
+    const detail = target.detail ?? mutationsDetailed(source, target.file, { profile });
+    const all = detail.mutations;
+    // Validate only the sample that will actually run. The old code parsed every
+    // candidate before sampling, which is quadratic on large files.
+    const sampled = selectMutations(all, maxMutations);
+    const picked = syntacticallyValid(source, target.file, sampled);
+    droppedForSyntax += sampled.length - picked.length;
     plan.push({
       file: target.file,
       testFiles: target.testFiles,
       source,
-      all: gated,
+      all,
+      parseError: detail.parseError ?? null,
+      language: detail.language ?? null,
       picked,
       effective: narrowCommand({ command, testFiles: target.testFiles, root }),
       results: new Map(),
@@ -168,6 +164,8 @@ export function finalizePlan(plan) {
       file: work.file,
       total: results.length,
       available: work.all.length,
+      parseError: work.parseError ?? null,
+      language: work.language ?? null,
       killed: killed.length,
       survived: survivors.length,
       errored: errored.length,

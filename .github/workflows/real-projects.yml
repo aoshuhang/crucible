@@ -22,16 +22,22 @@ jobs:
       matrix:
         include:
           - repo: axios/axios
+            ref: 71c87d506567e2fe37ba9f6fae6a4fc9411583d0
             expect: 0
           - repo: expressjs/express
+            ref: 43fca52d28a422c8be48fd489cbd4f2d6152bab6
             expect: 0
           - repo: lodash/lodash
+            ref: 2b5e6f7399a7b48005140b5d5c6bc6c0e62919a8
             expect: 0
           - repo: sindresorhus/p-map
+            ref: d61b6a33cc1d5533ad5711b435959f3f78c3d2fe
             expect: 0
           - repo: chalk/chalk
+            ref: 72110019e147683f60e13fa0ff5c14a0c27cd9fe
             expect: 0
           - repo: sindresorhus/slugify
+            ref: 99b35c2b0d6ccfad2b96ba9ce6997c6365b9a4b7
             expect: 0
 
     steps:
@@ -41,9 +47,22 @@ jobs:
         with:
           node-version: 22
 
+      - name: install crucible's parser dependency
+        run: npm ci --no-audit --no-fund
+
+      - name: check out the pinned target
+        run: |
+          # A floating default branch turns an upstream refactor into an apparent
+          # crucible regression. Pin the revision under test instead.
+          mkdir target-project
+          cd target-project
+          git init -q
+          git remote add origin "https://github.com/${{ matrix.repo }}"
+          git fetch -q --depth 1 origin "${{ matrix.ref }}"
+          git checkout -q FETCH_HEAD
+
       - name: install the target project
         run: |
-          git clone --depth 1 "https://github.com/${{ matrix.repo }}" target-project
           cd target-project
           # express ships an .npmrc with min-release-age that refuses a fresh
           # publish; relax it so the install succeeds.
@@ -69,3 +88,120 @@ jobs:
             }
             console.log(`OK: ${cannotFail} certain findings, ${r.summary.worthChecking} to review`);
           ' "${{ matrix.expect }}"
+
+  check-large-static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repo: nestjs/nest
+            ref: d9a546092b326e52d36fb57593f8ef29399b98ad
+            # One real weak test exists upstream (client-tcp "should send message").
+            expect: 1
+          - repo: vuejs/core
+            ref: f03b8ef784ff258dd84f5107d91534d437bbf378
+            # Two real upstream weak tests: one has its assertion commented out,
+            # one only constructs components without asserting.
+            expect: 2
+          - repo: pallets/flask
+            ref: 49943b5a94413a530761350f04e896f76e8d620e
+            expect: 0
+          - repo: django/django
+            ref: c896b3e536e55ca6cf55515b236ba11cfda072b0
+            expect: 0
+          - repo: pallets/click
+            ref: 08b803cf32ceb2ae6a772c62d5da42757a897d44
+            expect: 0
+          - repo: colinhacks/zod
+            ref: d40c329910436e528d3c26cb1b9179e05abebf05
+            # Five empty placeholder tests and four literal tautologies upstream.
+            expect: 9
+          - repo: fastapi/fastapi
+            ref: 05e6df7e906c3decba377c37548019973f40bf15
+            expect: 0
+          - repo: facebook/react
+            ref: edae846a9a17442c00429f2b15375afbfa0376c9
+            # Three literal placeholders + one intentionally empty test.
+            expect: 4
+          - repo: sqlalchemy/sqlalchemy
+            ref: 9c88919beb770ff0b14deab7e914ff7aaa5c4bd2
+            # One pass-only placeholder and one query smoke test.
+            expect: 2
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+
+      - name: check out pinned large project
+        run: |
+          mkdir target-project
+          cd target-project
+          git init -q
+          git remote add origin "https://github.com/${{ matrix.repo }}"
+          git fetch -q --depth 1 origin "${{ matrix.ref }}"
+          git checkout -q FETCH_HEAD
+
+      - name: static false-positive and performance check
+        run: |
+          start=$(date +%s)
+          node bin/crucible.js check target-project --json > large.json || true
+          elapsed=$(( $(date +%s) - start ))
+          node -e '
+            const fs = require("fs");
+            const r = JSON.parse(fs.readFileSync("large.json", "utf8"));
+            const expected = Number(process.argv[1]);
+            if (r.summary.cannotFail !== expected) {
+              console.error(`FAIL: ${r.summary.cannotFail} certain findings, expected ${expected}`);
+              process.exit(1);
+            }
+            if (Number(process.argv[2]) > 30) {
+              console.error(`FAIL: static check took ${process.argv[2]}s; performance regressed`);
+              process.exit(1);
+            }
+            console.log(`OK: ${r.summary.cannotFail} known weak tests, ${r.testFiles} test files, ${process.argv[2]}s`);
+          ' "${{ matrix.expect }}" "$elapsed"
+
+  go-mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - run: npm ci --no-audit --no-fund
+
+      - name: check out Gin
+        run: |
+          mkdir target-project
+          cd target-project
+          git init -q
+          git remote add origin https://github.com/gin-gonic/gin
+          git fetch -q --depth 1 origin 0f09c3a9b4626d9fe9979cf4d0521d6ae32ab646
+          git checkout -q FETCH_HEAD
+
+      - name: real Go mutation scan
+        run: |
+          node bin/crucible.js scan target-project --json --no-cache --jobs=1 \
+            --limit=1 --mutations=2 > go-report.json || true
+          node -e '
+            const fs = require("fs");
+            const r = JSON.parse(fs.readFileSync("go-report.json", "utf8"));
+            if (r.suiteError) {
+              console.error(`FAIL: Go suite could not run: ${r.suiteError}`);
+              process.exit(1);
+            }
+            if (r.mutationScore === null || r.files.length === 0) {
+              console.error("FAIL: Go mutation scan produced no score");
+              process.exit(1);
+            }
+            console.log(`OK: Go mutation score ${r.mutationScore}%`);
+          '

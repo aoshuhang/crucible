@@ -1,13 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cp, rm, readFile, writeFile, mkdtemp } from 'node:fs/promises';
+import { cp, readdir, rm, readFile, writeFile, mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { discover } from '../src/discover.js';
-import { baseline, auditFile } from '../src/judge.js';
+import { baseline, auditFile, expandWindowsGlobs } from '../src/judge.js';
 import { fixBoundaries } from '../src/fix-boundary.js';
 
-const FIXTURE = new URL('./fixtures/project/', import.meta.url).pathname;
+const FIXTURE = fileURLToPath(new URL('./fixtures/project/', import.meta.url));
 
 /**
  * The end-to-end claim this product makes: a fake test scores low, and after the
@@ -60,7 +61,14 @@ test('fix raises the mutation score on a project with a fake test', async (t) =>
     command: project.runner.command,
     maxMutations: 12,
   });
-  assert.ok(after.score > before.score, `score should improve: ${before.score} -> ${after.score}`);
+  const debug = {
+    command: project.runner.command,
+    expanded: expandWindowsGlobs(project.runner.command, project.root),
+    testFiles: await readdir(join(dir, 'tests')),
+    results: after.results.map((r) => `${r.mutation.description}=${r.verdict}`),
+  };
+  assert.ok(after.score > before.score,
+    `score should improve: ${before.score} -> ${after.score}; ${JSON.stringify(debug)}`);
 });
 
 test('generated boundary test calls at the threshold and its neighbours', async (t) => {

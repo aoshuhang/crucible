@@ -92,13 +92,16 @@ test('fix rolls its writes back when the suite goes red', async (t) => {
   const before = await readFile(join(dir, 'src/rand.js'), 'utf8');
 
   let code = 0;
+  let output = '';
   try {
-    await exec(process.execPath, [CLI, 'fix', dir], { timeout: 120_000 });
+    const result = await exec(process.execPath, [CLI, 'fix', dir, '--json'], { timeout: 120_000 });
+    output = String(result.stdout ?? '');
   } catch (error) {
     code = typeof error.code === 'number' ? error.code : -1;
+    output = `${error.stdout ?? ''}\n${error.stderr ?? ''}`;
   }
 
-  assert.equal(code, 1, 'a red suite after writing is a failure');
+  assert.equal(code, 1, `a red suite after writing is a failure; output=${output}`);
   await assert.rejects(access(fixPath), 'the generated file must be rolled back');
   assert.equal(await readFile(join(dir, 'src/rand.js'), 'utf8'), before);
 });

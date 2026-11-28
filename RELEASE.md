@@ -1,4 +1,8 @@
-# Release notes — crucible 0.1.0
+# Release notes — crucible 0.1.0 (historical)
+
+> These notes describe the original 0.1.0 release and preserve its measurements.
+> Features and limitations have changed since; see [CHANGELOG.md](CHANGELOG.md) and
+> the README for current behaviour.
 
 **Find the tests that cannot fail. Then fix them.**
 

@@ -29,7 +29,13 @@ export function comparisonsIn(source) {
     const re = /([\w.$\[\]'"]+)\s*(===|!==|==|!=|>=|<=|>|<)\s*([\w.$\[\]'"]+)/g;
     let m;
     while ((m = re.exec(line)) !== null) {
-      out.push({ line: i + 1, op: m[2], left: m[1], right: m[3] });
+      // Object-boundary verification uses the column to select the exact operator
+      // when two comparisons share a line.
+      out.push({
+        line: i + 1,
+        column: m.index + m[0].indexOf(m[2]) + 1,
+        op: m[2], left: m[1], right: m[3],
+      });
     }
   }
 

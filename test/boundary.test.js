@@ -21,6 +21,20 @@ test('loop counters are not boundaries', () => {
   assert.equal(isBoundaryMutation(mut('comparison', '<', 3), lines), false);
 });
 
+test('platform guards are not business boundaries', () => {
+  const lines = [
+    'if (os.name == "nt") {',
+    'if (sys.platform.startswith("cygwin")) {',
+    'if (process.platform === "win32") {',
+  ];
+  for (let line = 1; line <= lines.length; line += 1) {
+    const mutation = { kind: 'comparison', original: '==', line };
+    assert.equal(isBoundaryMutation(mutation, lines), false, lines[line - 1]);
+  }
+  assert.equal(isBoundaryMutation({ kind: 'comparison', original: '>=', line: 1 },
+    ['if (count >= MAX) {']), true);
+});
+
 test('a bare assignment is not a boundary', () => {
   assert.equal(isBoundaryMutation(mut('number', '1', 1), lines), false);
 });

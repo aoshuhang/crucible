@@ -52,20 +52,26 @@ export const NEIGHBOUR_OPERATOR = {
 };
 
 /**
- * Quote a word for a POSIX shell.
+ * Quote a word for the shell that `exec` will use.
  *
- * `JSON.stringify` was used here before, which produces DOUBLE quotes — and
- * inside double quotes the shell still expands `$(…)`, backticks and `\`. A test
- * file named `$(touch pwned).test.js` would execute its name. Single quotes are
- * literal in POSIX sh; a single quote inside the value is spliced as `'\''`.
+ * POSIX: single quotes are literal, so `$(…)` and backticks cannot execute. A
+ * quote inside the value is spliced as `'\''`.
  *
- * These commands run through `exec(command, shell)` on the user's machine, so
- * the quoting must hold for bash, zsh, dash and /bin/sh alike.
+ * Windows `cmd.exe`: single quotes are ordinary characters, so paths with
+ * spaces must use double quotes. Double quotes were unsafe on POSIX for the
+ * command-substitution reason above, but they are the correct Windows form.
  */
-export function shQuote(word) {
+export function shQuote(word, platform = process.platform) {
   const s = String(word);
+  const safe = /^[A-Za-z0-9_@%+=:,./\\-]+$/;
+  if (safe.test(s)) return s;
+
+  if (platform === 'win32') {
+    if (s === '') return '""';
+    // Windows file names cannot contain `"`, but command arguments can.
+    return `"${s.replace(/"/g, '\\"')}"`;
+  }
+
   if (s === '') return "''";
-  // Nothing metacharacter-ish can appear: keep it readable.
-  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(s)) return s;
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }

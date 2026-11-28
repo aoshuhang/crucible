@@ -64,15 +64,19 @@ test('code inside a template interpolation IS mutated', () => {
   const mutants = mutationsFor(src, 'x.js');
   assert.ok(mutants.some((m) => m.kind === 'comparison'),
     'the comparison inside ${...} is live code');
-  assert.ok(mutants.every((m) => m.description !== 'swap the ternary branches'),
-    'a ternary inside an interpolation cannot be swapped without breaking the template');
+  // The AST knows the expression span, so a branch swap inside `${...}` is now
+  // safe. Every candidate still has to parse as a complete module.
+  for (const mutation of mutants) {
+    assert.ok(parsesAsScript(applyMutation(src, mutation), 'x.js'), mutation.description);
+  }
 });
 
 test('parsesAsScript accepts real modules and rejects broken ones', () => {
   assert.notEqual(parsesAsScript('export const a = 1;\n', 'a.js'), null);
   assert.notEqual(parsesAsScript('const x = -1;\nconst y = a - b;\n', 'b.js'), null);
   assert.equal(parsesAsScript('const x = xs.map(x =>= 2);\n', 'c.js'), null);
-  assert.equal(parsesAsScript('let x: number = 1;', 'd.ts'), null, 'TS is not gated statically');
+  assert.notEqual(parsesAsScript('let x: number = 1;', 'd.ts'), null,
+    'TypeScript now has a real parser and valid TS must be accepted');
 });
 
 test('looksLikeSyntaxError recognises runner parse failures', () => {
@@ -110,6 +114,16 @@ test('looksLikeSyntaxError recognises runner parse failures', () => {
     'AssertionError: expected err.name to be \'SyntaxError\'',
     '1) math works:\n     Error: the parser did not throw a SyntaxError',
     'Error: could not parse the intent',
+    // Node 20 TAP prints a generic `error:` field on every assertion failure.
+    [
+      'not ok 2 - exactly at the threshold',
+      "  location: '/repo/tests/limits.exact.test.js:13:3'",
+      '  failureType: testCodeFailure',
+      '  error: |-',
+      '    Expected values to be strictly equal:',
+      '    false !== true',
+      "  code: 'ERR_ASSERTION'",
+    ].join('\n'),
   ];
   for (const notAnError of notErrors) {
     assert.equal(looksLikeSyntaxError(notAnError), false, `should NOT classify: ${notAnError.slice(0, 60)}`);
@@ -290,8 +304,12 @@ test('fix --json prints a machine-readable report', async (t) => {
   assert.ok(stdout.trim().length > 0, 'fix --json must print something');
   const report = JSON.parse(stdout);
   assert.ok(Array.isArray(report.written));
-  assert.equal(typeof report.suiteGreen, 'boolean');
+  assert.equal(report.suiteGreen, true);
   assert.ok(report.next, 'the report must carry the next action');
+  assert.equal(report.repairs.length, report.written.length);
+  assert.equal(report.repairs[0].status, 'repaired',
+    'a written boundary must be replayed against its exact mutant');
+  assert.ok(report.repairs[0].verified > 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -299,14 +317,17 @@ test('fix --json prints a machine-readable report', async (t) => {
 // ---------------------------------------------------------------------------
 
 test('shQuote is safe for hostile file names', () => {
-  assert.equal(shQuote('plain.js'), 'plain.js');
+  assert.equal(shQuote('plain.js', 'linux'), 'plain.js');
   // A single quote in the value is spliced as '\'' — the standard POSIX idiom.
-  assert.equal(shQuote("it's.js"), String.raw`'it'\''s.js'`);
+  assert.equal(shQuote("it's.js", 'linux'), String.raw`'it'\''s.js'`);
   // A command substitution in the name must not survive as live shell: it is
   // wrapped in single quotes, where the shell expands nothing.
-  const quoted = shQuote('$(touch pwned).test.js');
+  const quoted = shQuote('$(touch pwned).test.js', 'linux');
   assert.equal(quoted, String.raw`'$(touch pwned).test.js'`);
   assert.ok(quoted.startsWith("'"), 'hostile names are always single-quoted');
+
+  assert.equal(shQuote('C:\\Program Files\\x.js', 'win32'), '"C:\\Program Files\\x.js"');
+  assert.equal(shQuote('plain.js', 'win32'), 'plain.js');
 });
 
 // ---------------------------------------------------------------------------

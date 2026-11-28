@@ -25,15 +25,40 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      # No dependencies are needed to run the suite; npm install only validates the
-      # package manifest. `npm ci` would need a lockfile this project does not have.
-      - run: npm install --no-audit --no-fund
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install Python test runner
+        run: python -m pip install pytest
+
+      # The parser is a runtime dependency now. The lockfile makes installs
+      # reproducible on every matrix entry.
+      - run: npm ci --no-audit --no-fund
 
       - name: unit and end-to-end tests
         run: npm test
 
       - name: selftest (CLI over the fixture project)
         run: npm run selftest
+
+      - name: a complete audit labels its score complete
+        # Git Bash is present on every hosted runner; PowerShell does not support
+        # the POSIX line continuation or `|| true` used below.
+        shell: bash
+        run: |
+          node bin/crucible.js scan test/fixtures/project --json --no-cache --jobs=1 \
+            --limit=all --mutations=all --select=all > complete.json || true
+          node -e '
+            const r = require("./complete.json");
+            if (r.scoreKind !== "complete" || r.sampling?.complete !== true) {
+              console.error("expected scoreKind=complete", r.scoreKind, r.sampling);
+              process.exit(1);
+            }
+          '
+
+      - name: generated tests must kill their target mutation
+        run: node --test --test-concurrency=1 test/generated.test.js test/regression-03.test.js
 
       - name: the CLI starts and reports its environment
         run: node bin/crucible.js --version

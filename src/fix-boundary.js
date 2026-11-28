@@ -15,6 +15,8 @@ import { exportedNames, buildBoundaryTest, buildBoundaryProbe, parseProbeOutput,
 import { run, addFailFast, registerTempFile, unregisterTempFile } from './judge.js';
 import { mayWrite, stamp } from './guard.js';
 import { stem, relPosix, shQuote } from './paths.js';
+import { validateGeneratedTest } from './generated.js';
+import { pythonCommand } from './python-runtime.js';
 
 /**
  * Read the real return values at the boundary.
@@ -190,12 +192,19 @@ export async function fixBoundaries(options) {
   const mapped = mapComparisonsToFunctions(source, sourceFile);
 
   if (mapped.length === 0) {
-    return { written: null, cases: 0, reason: 'no boundary comparison inside an exported function' };
+    return {
+      written: null,
+      cases: 0,
+      reason: isPython(sourceFile)
+        ? 'no boundary comparison inside a module-level Python function; class methods are not auto-fixed'
+        : 'no boundary comparison inside an exported function',
+    };
   }
 
   // Group by function, one case per comparison, resolving constants as we go.
   const cases = [];
   const skippedFns = [];
+  const unresolved = [];
 
   for (const { fn, comparison } of mapped) {
     if (!takesNumericArgument(source, fn)) {
@@ -204,31 +213,41 @@ export async function fixBoundaries(options) {
     }
 
     const values = boundaryValues({ comparison, source });
-    if (!values) continue;
+    if (!values) {
+      unresolved.push({
+        fn, line: comparison.line,
+        expression: `${comparison.left} ${comparison.op} ${comparison.right}`,
+        reason: `could not resolve ${comparison.right} to a numeric threshold`,
+      });
+      continue;
+    }
 
     cases.push({
       fn,
       op: comparison.op,
+      line: comparison.line,
+      column: comparison.column ?? null,
       constantName: comparison.right,
       values,
     });
   }
 
-  if (cases.length === 0) {
-    const manual = skippedFns.length > 0
-      ? mapComparisonsToFunctions(source)
-        .filter((m) => skippedFns.includes(m.fn))
-        .map((m) => suggestManualBoundary({
-          fn: m.fn,
-          comparison: m.comparison,
-          sourceLines: source.split('\n'),
-        }))
-      : [];
+  const manual = skippedFns.length > 0
+    ? mapComparisonsToFunctions(source)
+      .filter((m) => skippedFns.includes(m.fn))
+      .map((m) => suggestManualBoundary({
+        fn: m.fn,
+        comparison: m.comparison,
+        sourceLines: source.split('\n'),
+      }))
+    : [];
 
+  if (cases.length === 0) {
     return {
       written: null,
       cases: 0,
-      manual,
+      manual: manual,
+      unresolved,
       reason: skippedFns.length > 0
         ? `${skippedFns.join(', ')} take a non-numeric argument, so the boundary needs a hand-written case`
         : 'no numeric threshold could be resolved',
@@ -251,7 +270,7 @@ export async function fixBoundaries(options) {
       const pyProbe = buildPythonProbe({ importPath, cases });
       await writeFile(probePath, pyProbe, 'utf8');
 
-      const pyRun = await run(`python3 ${shQuote(probePath)}`, root, 60_000);
+      const pyRun = await run(`${pythonCommand()} ${shQuote(probePath)}`, root, 60_000);
 
       let probed = null;
       const marker = 'CRUCIBLE_PROBE';
@@ -278,18 +297,13 @@ export async function fixBoundaries(options) {
         }
       }
 
-      const usablePy = cases.filter((c) => c.observed.some((v) => v !== undefined));
+      const usablePy = cases.filter((c) => {
+        const values = c.observed.filter((v) => v !== undefined);
+        return values.length === 3
+          && new Set(values.map((v) => JSON.stringify(v))).size >= 2;
+      });
       if (usablePy.length === 0) {
-        return { written: null, cases: 0, reason: 'every boundary call raised' };
-      }
-
-      const distinctPy = new Set(usablePy.flatMap((c) => c.observed.map((v) => JSON.stringify(v))));
-      if (distinctPy.size < 2) {
-        return {
-          written: null,
-          cases: 0,
-          reason: 'all three boundary points return the same value, so a test here would catch nothing',
-        };
+        return { written: null, cases: 0, reason: 'no boundary case returns two distinct observed values' };
       }
 
       const pyBody = buildPythonBoundaryTest({
@@ -297,11 +311,19 @@ export async function fixBoundaries(options) {
         sourceName: stem(sourceFile),
         cases: usablePy,
       });
+      const pyContract = validateGeneratedTest(pyBody, fixPath);
+      if (!pyContract.valid) return { written: null, cases: 0, reason: pyContract.reason };
 
       const pyGate = await mayWrite(fixPath, { force: options.force });
       if (!pyGate.write) return { written: null, cases: 0, reason: pyGate.reason };
       await writeFile(fixPath, stamp(pyBody, 'py'), 'utf8');
-      return { written: fixPath, cases: usablePy.length };
+      return {
+        written: fixPath,
+        cases: usablePy.length,
+        targets: usablePy.map((c) => ({ line: c.line, column: c.column, op: c.op, fn: c.fn })),
+        unresolved,
+        manual,
+      };
     }
 
     const probeBody = buildBoundaryProbe({ importPath, cases });
@@ -330,9 +352,17 @@ export async function fixBoundaries(options) {
       }
     }
 
-    const usable = cases.filter((c) => c.observed.some((v) => v !== undefined));
+    const usable = cases.filter((c) => {
+      const values = c.observed.filter((v) => v !== undefined);
+      return values.length === 3
+        && new Set(values.map((v) => JSON.stringify(v))).size >= 2;
+    });
     if (usable.length === 0) {
-      return { written: null, cases: 0, reason: 'every boundary call threw' };
+      return {
+        written: null,
+        cases: 0,
+        reason: 'no comparison returns two distinct values around its threshold, so a test would catch nothing',
+      };
     }
 
     const body = buildBoundaryTest({
@@ -342,11 +372,20 @@ export async function fixBoundaries(options) {
       cases: usable,
     });
 
+    const contract = validateGeneratedTest(body, fixPath);
+    if (!contract.valid) return { written: null, cases: 0, reason: contract.reason };
+
     const jsGate = await mayWrite(fixPath, { force: options.force });
     if (!jsGate.write) return { written: null, cases: 0, reason: jsGate.reason };
 
     await writeFile(fixPath, stamp(body, 'js'), 'utf8');
-    return { written: fixPath, cases: usable.length };
+    return {
+      written: fixPath,
+      cases: usable.length,
+      targets: usable.map((c) => ({ line: c.line, column: c.column, op: c.op, fn: c.fn })),
+      unresolved,
+      manual,
+    };
   } finally {
     await rm(probePath, { force: true });
     unregisterTempFile(probePath);

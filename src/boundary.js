@@ -18,6 +18,19 @@ import { NEIGHBOUR_OPERATOR } from './paths.js';
 const COMPARISONS = new Set(['===', '!==', '==', '!=', '>=', '<=', '>', '<']);
 
 /**
+ * A comparison against the host platform/environment is not a business boundary.
+ * On macOS, `os.name == "nt"` is unreachable; calling it an untested edge sends
+ * the user after Windows-only behaviour their CI cannot exercise. Survivors on
+ * these lines remain suspect, but are not promoted to likely boundaries.
+ */
+const PLATFORM_GUARD = /\b(?:os\.name|sys\.platform|platform\.system|process\.platform|process\.arch|process\.versions|runtime\.GOOS|runtime\.GOARCH|TYPE_CHECKING|cygwin|win32|darwin|linux|android|typeof\s+(?:window|process|document|navigator)|navigator\s*\.|window\s*\.|document\s*\.)/;
+
+export function isPlatformGuard(mutation, sourceLines) {
+  const line = sourceLines[mutation.line - 1] ?? '';
+  return PLATFORM_GUARD.test(line);
+}
+
+/**
  * Loop counters are not business boundaries. Flipping `i < 512` in a `for` loop
  * is usually equivalent or trivially covered; reporting it as an untested edge
  * would be noise.
@@ -45,6 +58,7 @@ export function isBoundaryMutation(mutation, sourceLines = []) {
   if (mutation.kind !== 'comparison') return false;
   if (!COMPARISONS.has(mutation.original)) return false;
   if (isLoopBoundary(mutation, sourceLines)) return false;
+  if (isPlatformGuard(mutation, sourceLines)) return false;
   return true;
 }
 
@@ -58,6 +72,7 @@ export function isBoundaryMutation(mutation, sourceLines = []) {
  */
 export function isThresholdLiteral(mutation, sourceLines) {
   if (mutation.kind !== 'number') return false;
+  if (isPlatformGuard(mutation, sourceLines)) return false;
   const line = sourceLines[mutation.line - 1] ?? '';
   if (/\b(for|while)\s*\(/.test(line)) return false;
   if (/[|&^~]/.test(line)) return false; // bitwise tricks, not thresholds

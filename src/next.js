@@ -35,7 +35,7 @@ export function nextStepFor(finding, context) {
     return {
       kind: 'run_command',
       command: `npx @hsaohuang/crucible fix ${JSON.stringify(context.root)}`,
-      instruction: 'Writes the boundary test. Re-run scan afterwards to confirm the score moved.',
+      instruction: 'Attempts to write the boundary test. It may refuse when the edge is not observable. Treat the repair as unproven until fix reports the target mutation as killed and scan confirms the score moved.',
     };
   }
 
@@ -106,7 +106,7 @@ export function planFor({ findings, summary, suiteGreen, root }) {
       order: steps.length + 1,
       action: 'run_command',
       command: `npx @hsaohuang/crucible fix ${JSON.stringify(root)}`,
-      why: `${autoFixable.length} missing boundary test${autoFixable.length === 1 ? '' : 's'} can be written automatically; run it before editing by hand`,
+      why: `${autoFixable.length} boundary finding${autoFixable.length === 1 ? '' : 's'} may be auto-fixable; fix will refuse an edge it cannot observe and verifies each target mutation it writes for`,
     });
   }
 
@@ -136,6 +136,7 @@ export function planFor({ findings, summary, suiteGreen, root }) {
   const doNotClaim = [
     'that the tests are real without re-running scan',
     `that ${summary.worthChecking} suspect findings are defects — they may be intentional property tests`,
+    'that a generated file repaired a survivor solely because the suite stayed green — the target mutation must be killed',
   ];
   if (suiteGreen === null) {
     doNotClaim.push('any mutation score — no tests were executed in this run');

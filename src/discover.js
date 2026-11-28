@@ -11,6 +11,8 @@
 
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, relative, resolve, dirname, basename, extname } from 'node:path';
+import { parseJs, walk as walkAst, isJsFile } from './js-ast.js';
+import { pythonCommand } from './python-runtime.js';
 
 /** Directories that never contain product source worth auditing. */
 const SKIP_DIRS = new Set([
@@ -31,6 +33,7 @@ const TEST_PATTERNS = [
   /(^|\/)tests\.[cm]?[jt]sx?$/,          // tests.js
   /_test\.go$/,                          // foo_test.go  (Go)
   /_test\.rs$/,                          // tests live in #[cfg(test)] or tests/
+  /(^|\/)tests\/.*\.rs$/,                // Rust integration-test convention
   /Tests?\.swift$/,                      // FooTests.swift
   /(^|\/)[^/]+Tests?\.(cs|java|kt)$/,    // FooTest.cs
 ];
@@ -59,10 +62,21 @@ const UNSUPPORTED_SOURCE_EXT = new Set([
 const SFC_EXT = new Set(['.vue', '.svelte']);
 
 /** Files that are entry points or config, not worth mutating. */
-const SKIP_SOURCE = /(^|\/)(main|setup|config|vite\.config|jest\.config|vitest\.config|webpack\.config|rollup\.config|tsup\.config|eslint\.config)\.[cm]?[jt]sx?$/;
+const SKIP_SOURCE = /(^|\/)(main|setup|config|vite\.config|jest\.config|vitest\.config|webpack\.config|rollup\.config|tsup\.config|eslint\.config|playwright\.config|babel\.config|gulpfile|Gruntfile)\.[cm]?[jt]sx?$/;
+
+/**
+ * Test support, examples and build tooling are not product source. Test FILES in
+ * these directories are still discovered; only non-test source candidates are
+ * excluded. Before this, Flask's tests/conftest.py and tests/test_apps fixtures,
+ * axios examples and lodash build scripts appeared as "untested source".
+ */
+const SKIP_SOURCE_PATH = /(^|\/)(?:tests?|__tests__|__mocks__|examples?|samples?|docs?|docs?[-_]src|benchmarks?|perf|sandbox|integrations?(?:-tests?)?|_support)\//;
 
 /** Type declaration files carry no runtime behaviour to mutate. */
 const SKIP_SOURCE_EXT = /\.d\.[cm]?ts$/;
+
+/** Hidden JS files are tool setup (.markdown-doctest-setup.js), not product code. */
+const HIDDEN_JS = /^\./;
 
 /** Directories that are entry points rather than library code. */
 const SKIP_SOURCE_DIR = /(^|\/)(bin|scripts|cli|fixtures|__fixtures__)\//;
@@ -147,9 +161,10 @@ async function walk(dir, root, acc, depth = 0) {
 
     const isTest = TEST_PATTERNS.some((re) => re.test(relative(root, full).split('\\').join('/')));
     if (isTest) acc.testFiles.push(full);
-    else if (!SKIP_SOURCE.test(relative(root, full)) && !SKIP_SOURCE_EXT.test(entry.name)) {
+    else if (!SKIP_SOURCE.test(relative(root, full)) && !SKIP_SOURCE_EXT.test(entry.name)
+      && !(HIDDEN_JS.test(entry.name) && /\.[cm]?jsx?$/.test(entry.name))) {
       const rel = relative(root, full).split('\\').join('/');
-      if (SKIP_SOURCE_DIR.test(rel)) continue;
+      if (SKIP_SOURCE_DIR.test(rel) || SKIP_SOURCE_PATH.test(rel)) continue;
       acc.sourceFiles.push(full);
     }
   }
@@ -159,23 +174,35 @@ async function walk(dir, root, acc, depth = 0) {
  * Read a test file and extract every import/require path plus bare identifiers.
  * We resolve them relative to the test file and match against known sources.
  */
-function referencedSpecifiers(text) {
+function referencedSpecifiers(text, file = '', parsed = undefined) {
   const specs = new Set();
 
-  const patterns = [
-    /\bfrom\s+['"]([^'"]+)['"]/g,            // ES import ... from 'x'
-    /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g, // dynamic import('x')
-    /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g, // require('x')
-    /^\s*import\s+['"]([^'"]+)['"]/gm,        // side-effect import 'x'
-    /\b(?:from|import)\s+([\w.]+)\s+import/g, // python: from x import
-  ];
+  if (isJsFile(file)) {
+    // AST imports only. Regex scanning also saw sample code in strings/comments,
+    // which could make an unrelated test look like a covering test.
+    const ast = parsed === undefined ? parseJs(text, file).ast : parsed;
+    if (!ast) return [];
+    walkAst(ast.program, (node) => {
+      if (['ImportDeclaration', 'ExportNamedDeclaration', 'ExportAllDeclaration'].includes(node.type)
+        && node.source?.type === 'StringLiteral') specs.add(node.source.value);
+      if (node.type === 'CallExpression' && node.arguments[0]?.type === 'StringLiteral'
+        && (node.callee.type === 'Import'
+          || (node.callee.type === 'Identifier' && node.callee.name === 'require'))) {
+        specs.add(node.arguments[0].value);
+      }
+    });
+    return [...specs];
+  }
 
+  const patterns = [
+    /\b(?:from|import)\s+([\w.]+)\s+import/g, // python: from x import
+    /^\s*import\s+([\w.]+)\s*$/gm,           // python: import x
+  ];
   for (const re of patterns) {
     re.lastIndex = 0;
     let m;
     while ((m = re.exec(text)) !== null) specs.add(m[1]);
   }
-
   return [...specs];
 }
 
@@ -396,10 +423,11 @@ async function detectRunner(root) {
     }
   }
 
+  const python = pythonCommand();
   for (const [file, command, name] of [
-    ['pytest.ini', 'python3 -m pytest -x -q', 'pytest'],
-    ['pyproject.toml', 'python3 -m pytest -x -q', 'pytest'],
-    ['tox.ini', 'python3 -m pytest -x -q', 'pytest'],
+    ['pytest.ini', `${python} -m pytest -x -q`, 'pytest'],
+    ['pyproject.toml', `${python} -m pytest -x -q`, 'pytest'],
+    ['tox.ini', `${python} -m pytest -x -q`, 'pytest'],
     ['go.mod', 'go test ./...', 'go test'],
     ['Cargo.toml', 'cargo test --quiet', 'cargo test'],
     ['Package.swift', 'swift test', 'swift test'],
@@ -607,6 +635,122 @@ export async function workspaceDirs(root) {
   return packages.sort();
 }
 
+/** Strip JSONC comments and trailing commas without touching comment-like strings. */
+function parseJsonConfig(text) {
+  let out = '';
+  let quote = null;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (quote) {
+      out += ch;
+      if (ch === '\\') { out += next ?? ''; i += 1; }
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; out += ch; continue; }
+    if (ch === '/' && next === '/') { while (i < text.length && text[i] !== '\n') i += 1; out += '\n'; continue; }
+    if (ch === '/' && next === '*') { i += 2; while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i += 1; i += 1; continue; }
+    out += ch;
+  }
+  try { return JSON.parse(out.replace(/,\s*([}\]])/g, '$1')); } catch { return null; }
+}
+
+function normalizeConfigTarget(root, baseUrl, target) {
+  return normalisePath(root, resolve(root, baseUrl, target))
+    .replace(/\*$/, '');
+}
+
+/**
+ * Module-resolution hints the project already declares.
+ * Without these, `@/lib/f` is recorded as an npm package and every aliased source
+ * file looks untested even though its tests run it.
+ */
+async function projectResolutionHints(root, sources) {
+  let config = null;
+  for (const name of ['tsconfig.json', 'jsconfig.json']) {
+    try { config = parseJsonConfig(await readFile(join(root, name), 'utf8')); if (config) break; } catch { /* try next */ }
+  }
+
+  const aliases = [];
+  const options = config?.compilerOptions ?? {};
+  const baseUrl = typeof options.baseUrl === 'string' ? options.baseUrl : '.';
+  if (options.paths && typeof options.paths === 'object') {
+    for (const [pattern, targets] of Object.entries(options.paths)) {
+      if (!Array.isArray(targets)) continue;
+      for (const target of targets) {
+        if (typeof target !== 'string') continue;
+        const star = pattern.indexOf('*');
+        aliases.push({
+          pattern,
+          prefix: star === -1 ? pattern : pattern.slice(0, star),
+          suffix: star === -1 ? '' : pattern.slice(star + 1),
+          targetPrefix: normalizeConfigTarget(root, baseUrl, target),
+        });
+      }
+    }
+  }
+
+  const packages = new Map();
+  const roots = [root, ...(await workspaceDirs(root))];
+  for (const dir of roots) {
+    try {
+      const pkg = JSON.parse(await readFile(join(dir, 'package.json'), 'utf8'));
+      if (typeof pkg.name === 'string') packages.set(pkg.name, dir);
+    } catch { /* not an npm package */ }
+  }
+  return { aliases, packages };
+}
+
+function aliasedKey(spec, aliases) {
+  for (const alias of aliases) {
+    if (!spec.startsWith(alias.prefix) || !spec.endsWith(alias.suffix)) continue;
+    const middle = spec.slice(alias.prefix.length, spec.length - alias.suffix.length);
+    return `${alias.targetPrefix}${middle}`.replace(/\/+/g, '/');
+  }
+  return null;
+}
+
+/** Identifiers in executable code, never words inside comments or strings. */
+function codeWords(text, file, parsed = undefined) {
+  const words = new Set();
+  if (isJsFile(file)) {
+    const ast = parsed === undefined ? parseJs(text, file).ast : parsed;
+    if (!ast) return words;
+    walkAst(ast.program, (node) => {
+      if ((node.type === 'Identifier' || node.type === 'JSXIdentifier') && typeof node.name === 'string') words.add(node.name);
+    });
+    return words;
+  }
+
+  let cleaned = '';
+  let quote = null;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (quote) {
+      if (ch === '\\') { cleaned += '  '; i += 1; continue; }
+      if (ch === quote) quote = null;
+      cleaned += ch === '\n' ? '\n' : ' ';
+      continue;
+    }
+    if (ch === '#' && (file.endsWith('.py') || file.endsWith('.rb'))) {
+      while (i < text.length && text[i] !== '\n') { cleaned += ' '; i += 1; }
+      cleaned += '\n';
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      while (i < text.length && text[i] !== '\n') { cleaned += ' '; i += 1; }
+      cleaned += '\n';
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; cleaned += ch; continue; }
+    cleaned += ch;
+  }
+  for (const match of cleaned.matchAll(/\b[A-Za-z_$][\w$]*\b/g)) words.add(match[0]);
+  return words;
+}
+
 export async function discover(root) {
   const abs = resolve(root);
 
@@ -619,13 +763,107 @@ export async function discover(root) {
   const acc = { sourceFiles: [], testFiles: [], sfcFiles: [], truncated: false };
   await walk(abs, abs, acc);
 
-  /** @type {Map<string,string[]>} */
+  /** High-confidence coverage: a resolved import, a Go sibling, or the Rust
+   * integration-test crate convention. */
   const covers = new Map();
-  for (const src of acc.sourceFiles) covers.set(src, []);
+  /** Suggestions only. These never drive mutation scores. */
+  const heuristicCovers = new Map();
+  const coverEvidence = new Map();
+  for (const src of acc.sourceFiles) {
+    covers.set(src, []);
+    heuristicCovers.set(src, []);
+    coverEvidence.set(src, []);
+  }
 
-  // Build a lookup from normalised source key to absolute source path.
+  // Build a lookup from normalised source key to absolute source path. Python
+  // src-layout projects import `mypkg.mod`, while the file is `src/mypkg/mod.py`,
+  // so the suffix after `/src/` is a second valid lookup key.
   const byKey = new Map();
-  for (const src of acc.sourceFiles) byKey.set(normalisePath(abs, src), src);
+  const altCandidates = new Map();
+  const addAlt = (key, src) => {
+    if (!altCandidates.has(key)) altCandidates.set(key, []);
+    altCandidates.get(key).push(src);
+  };
+  for (const src of acc.sourceFiles) {
+    const primary = normalisePath(abs, src);
+    byKey.set(primary, src);
+
+    const rel = normalizeSlash(relative(abs, src));
+    const keys = [];
+    const srcMatch = rel.match(/(?:^|\/)src\/(.+)$/);
+    if (srcMatch) keys.push(normalisePath(abs, join(abs, srcMatch[1])));
+    // `require('../')` / `import '.'` resolve to the directory, whose entry is
+    // index.js. Nested index files are already normalised to their directory.
+    if (/^index\.[cm]?[jt]sx?$/.test(rel)) keys.push('');
+    // Python imports a package, not its __init__ file:
+    // `from flask import Flask` executes src/flask/__init__.py.
+    if (basename(src) === '__init__.py') {
+      keys.push(primary.replace(/\/__init__$/, ''));
+      if (srcMatch) keys.push(normalisePath(abs, join(abs, srcMatch[1])).replace(/\/__init__$/, ''));
+    }
+    for (const key of keys) {
+      if (key !== primary) addAlt(key, src);
+    }
+  }
+  const byKeyAlt = new Map();
+  for (const [alt, sources] of altCandidates) {
+    // Monorepo packages can each contain src/pkg/mod. A suffix that identifies
+    // more than one file is not a resolution, so it is left ambiguous rather
+    // than sending mutation at the wrong package.
+    if (sources.length === 1 && !byKey.has(alt)) byKeyAlt.set(alt, sources[0]);
+  }
+
+  const hints = await projectResolutionHints(abs, acc.sourceFiles);
+  const sourcesByBase = new Map();
+  for (const src of acc.sourceFiles) {
+    const base = basename(src).replace(/\.[^.]+$/, '');
+    if (base.length < 4) continue;
+    if (!sourcesByBase.has(base)) sourcesByBase.set(base, []);
+    sourcesByBase.get(base).push(src);
+  }
+
+  const record = (source, testFile, reason) => {
+    if (!covers.get(source).includes(testFile)) {
+      covers.get(source).push(testFile);
+      coverEvidence.get(source).push({ test: testFile, reason });
+    }
+  };
+
+  /** Resolve a module specifier from a test or source file to a known source. */
+  const resolveSpecifier = (spec, fromFile, pythonFile) => {
+    if (spec.startsWith('node:') || spec.startsWith('http')) return null;
+    let key = null;
+    let reason = null;
+
+    if (spec.startsWith('.')) {
+      const pyStyle = pythonFile && spec.split('/')[0].match(/^\.+(\w.*)$/);
+      const resolved = pyStyle
+        ? resolve(dirname(fromFile), spec.replace(/^\.+/, '').replace(/\./g, '/'))
+        : resolve(dirname(fromFile), spec);
+      key = normalisePath(abs, resolved);
+      reason = 'relative-import';
+    } else if (pythonFile) {
+      key = normaliseSpec(spec);
+      reason = 'python-import';
+    } else {
+      const normalized = normaliseJsSpec(spec);
+      key = aliasedKey(normalized, hints.aliases);
+      reason = key ? 'tsconfig-alias' : null;
+      if (!key) {
+        for (const [name, dir] of hints.packages) {
+          if (spec === name) key = normalisePath(abs, dir);
+          else if (spec.startsWith(`${name}/`)) key = normalisePath(abs, join(dir, spec.slice(name.length + 1)));
+          if (key) { reason = 'workspace-package'; break; }
+        }
+      }
+      if (!key) { key = normalized; reason = 'bare-import'; }
+    }
+
+    const target = byKey.get(key) ?? byKeyAlt.get(key);
+    return target ? { target, reason } : null;
+  };
+
+  const directTargetsByTest = new Map();
 
   // Sorted, not readdir order: the covering-test list feeds the cache key and the
   // report, so it must be the same on every run and every machine.
@@ -637,7 +875,8 @@ export async function discover(root) {
       continue;
     }
 
-    const specs = referencedSpecifiers(text);
+    const parsedAst = isJsFile(testFile) ? parseJs(text, testFile).ast : undefined;
+    const specs = referencedSpecifiers(text, testFile, parsedAst);
     const seen = new Set();
     // Python resolves modules by dots (`from lib.mod import x`), JS by slashes.
     // Dots-to-slashes must only apply to python tests: in a JS test,
@@ -645,61 +884,99 @@ export async function discover(root) {
     // falsely map the test onto a local `lodash/merge.js` if one happens to exist.
     const pythonTest = testFile.endsWith('.py');
 
+    const directTargets = [];
     for (const spec of specs) {
-      if (spec.startsWith('node:') || spec.startsWith('http')) continue;
-
-      // Relative specifier: resolve against the test file's directory.
-      let key = null;
-      if (spec.startsWith('.')) {
-        // A dot-leading Python relative import (`from .mod import clamp`) resolves
-        // against the test file's own package, same as a JS relative path — but
-        // dots are the separator, not a path prefix to strip.
-        const pyStyle = pythonTest && spec.split('/')[0].match(/^\.+(\w.*)$/);
-        const resolved = pyStyle
-          ? resolve(dirname(testFile), spec.replace(/^\.+/, '').replace(/\./g, '/'))
-          : resolve(dirname(testFile), spec);
-        key = normalisePath(abs, resolved);
-      } else {
-        key = pythonTest ? normaliseSpec(spec) : normaliseJsSpec(spec);
+      const resolved = resolveSpecifier(spec, testFile, pythonTest);
+      if (resolved && !seen.has(resolved.target)) {
+        seen.add(resolved.target);
+        directTargets.push(resolved.target);
+        record(resolved.target, testFile, resolved.reason);
       }
+    }
+    directTargetsByTest.set(testFile, directTargets);
 
-      const target = byKey.get(key);
-      if (target && !seen.has(target)) {
-        seen.add(target);
-        covers.get(target).push(testFile);
+    // A basename mention is a useful hint but not proof the test executes the file.
+    // It is kept out of `covers` because scoring a guessed relation produces
+    // survivors no test can explain. Only identifiers in executable code count;
+    // words in comments, fixtures or import strings do not.
+    const words = codeWords(text, testFile, parsedAst);
+    for (const [base, sources] of sourcesByBase) {
+      if (!words.has(base)) continue;
+      for (const src of sources) {
+        if (seen.has(src)) continue;
+        if (!heuristicCovers.get(src).includes(testFile)) heuristicCovers.get(src).push(testFile);
       }
     }
 
-    // Fallback: a test that mentions the source basename is likely covering it.
-    // Import/require specifiers are stripped first: `import x from 'lodash.merge'`
-    // mentions `merge`, but it names an npm package, not the local lodash/merge.js.
-    const stripped = text
-      .replace(/\b(?:from\s*|import\s*|require\s*\(\s*)['"][^'"]+['"]/g, '')
-      .replace(/\bimport\s*\(\s*['"][^'"]+['"]\s*\)/g, '');
-    for (const src of acc.sourceFiles) {
-      if (seen.has(src)) continue;
-      const base = basename(src).replace(/\.[^.]+$/, '');
-      if (base.length < 4) continue;
-      const re = new RegExp(`\\b${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-      if (re.test(stripped)) {
-        seen.add(src);
-        covers.get(src).push(testFile);
-      }
-    }
-
-    // Go convention: `foo_test.go` sits beside `foo.go` in the same package and
-    // calls its functions directly, so there is no import to resolve. Match by
-    // name and directory instead.
-    const goTest = testFile.match(/^(.*)\/([^/]+)_test\.go$/);
+    // Go compiles every non-test .go file in a package into the test binary.
+    // A file named `binding_test.go` therefore executes all of binding/*.go, not
+    // only a same-named binding.go.
+    const goTest = normalizeSlash(testFile).match(/^(.*)\/([^/]+)_test\.go$/);
     if (goTest) {
-      const [, dir, base] = goTest;
-      const sibling = byKey.get(normalisePath(abs, `${dir}/${base}.go`));
-      if (sibling && !seen.has(sibling)) {
-        seen.add(sibling);
-        covers.get(sibling).push(testFile);
+      const [, goDir] = goTest;
+      for (const source of acc.sourceFiles) {
+        if (!source.endsWith('.go')) continue;
+        if (normalizeSlash(dirname(source)) !== normalizeSlash(goDir)) continue;
+        if (seen.has(source)) continue;
+        seen.add(source);
+        directTargets.push(source);
+        record(source, testFile, 'go-package-test');
+      }
+    }
+
+    // Rust's standard integration tests live in `tests/*.rs` and import the crate
+    // root. Attribute them to src/lib.rs (or src/main.rs when there is no lib).
+    if (/\/tests\/[^/]+\.rs$/.test(normalizeSlash(testFile))) {
+      const crate = byKey.get('src/lib.rs') ?? byKey.get('src/main.rs');
+      if (crate) {
+        seen.add(crate);
+        directTargets.push(crate);
+        record(crate, testFile, 'rust-integration-test');
+      }
+    }
+    directTargetsByTest.set(testFile, directTargets);
+  }
+
+  // Importing a barrel/package entry executes its internal imports. A test of
+  // `flask` or `src/index.ts` therefore covers the modules those files load.
+  // Cache each source's internal dependency list; closure is per test and cycle safe.
+  const dependencyCache = new Map();
+  const sourceSet = new Set(acc.sourceFiles);
+  const dependenciesOf = async (source) => {
+    if (dependencyCache.has(source)) return dependencyCache.get(source);
+    let text;
+    try { text = await readFile(source, 'utf8'); } catch {
+      dependencyCache.set(source, []);
+      return [];
+    }
+    let deps = [];
+    if (/\.(?:[cm]?[jt]sx?|py)$/i.test(source)) {
+      const parsedAst = isJsFile(source) ? parseJs(text, source).ast : undefined;
+      const specs = referencedSpecifiers(text, source, parsedAst);
+      deps = [...new Set(specs
+        .map((spec) => resolveSpecifier(spec, source, source.endsWith('.py'))?.target)
+        .filter((target) => target && sourceSet.has(target) && target !== source))].sort();
+    }
+    dependencyCache.set(source, deps);
+    return deps;
+  };
+
+  for (const [testFile, directTargets] of directTargetsByTest) {
+    const reached = new Set(directTargets);
+    const queue = [...directTargets];
+    while (queue.length > 0) {
+      const source = queue.shift();
+      for (const dependency of await dependenciesOf(source)) {
+        if (reached.has(dependency)) continue;
+        reached.add(dependency);
+        queue.push(dependency);
+        record(dependency, testFile, 'transitive-import');
       }
     }
   }
+
+  for (const tests of covers.values()) tests.sort();
+  for (const tests of heuristicCovers.values()) tests.sort();
 
   return {
     root: abs,
@@ -710,6 +987,8 @@ export async function discover(root) {
     // `sourceFiles`; the CLI labels them instead of implying full coverage.
     sfcFiles: acc.sfcFiles.sort(),
     covers,
+    heuristicCovers,
+    coverEvidence,
     runner: await detectRunner(abs),
     packageManager: await detectPackageManager(abs),
     truncated: acc.truncated,
@@ -720,4 +999,8 @@ export async function discover(root) {
       : [],
     workspaces: await workspaceDirs(abs),
   };
+}
+
+function normalizeSlash(path) {
+  return path.split('\\').join('/');
 }

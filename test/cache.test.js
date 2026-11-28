@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   cacheFileFor, cacheKey, loadCache, saveCache, cacheableResult, isUsableResult,
+  workspaceFingerprint,
 } from '../src/cache.js';
 
 async function projectDir(t) {
@@ -52,6 +53,34 @@ test('entries survive a save and load round trip', async (t) => {
   // The file really is JSON on disk, not an in-memory illusion.
   const raw = JSON.parse(await readFile(reloaded.file, 'utf8'));
   assert.ok(raw.entries[key]);
+});
+
+test('an indirect source or toolchain change cannot reuse a result', () => {
+  const key = cacheKey(base);
+  assert.notEqual(cacheKey({ ...base, workspace: 'dep-a' }), key,
+    'a changed dependency must invalidate the entry');
+  assert.notEqual(cacheKey({ ...base, environment: 'node 24/macos' }), key,
+    'a different runtime can change runner behavior');
+});
+
+test('the workspace fingerprint covers files outside the audited pair', async (t) => {
+  const dir = await projectDir(t);
+  const source = join(dir, 'src/a.js');
+  const dependency = join(dir, 'src/b.js');
+  await mkdir(join(dir, 'src'), { recursive: true });
+  await writeFile(source, 'export const a = 1;\n', 'utf8');
+  await writeFile(dependency, 'export const b = 1;\n', 'utf8');
+
+  const project = { root: dir, sourceFiles: [source, dependency], testFiles: [] };
+  const before = await workspaceFingerprint(project);
+  await writeFile(dependency, 'export const b = 2;\n', 'utf8');
+  const after = await workspaceFingerprint(project);
+
+  assert.notEqual(after, before, 'changing the imported module must invalidate the cache');
+
+  await writeFile(join(dir, 'vitest.config.ts'), 'export default { test: { environment: "jsdom" } };\n', 'utf8');
+  const withConfig = await workspaceFingerprint(project);
+  assert.notEqual(withConfig, after, 'a runner config changes how tests execute');
 });
 
 test('a cache written by another format version is ignored', async (t) => {
