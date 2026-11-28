@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cp, rm, mkdtemp, readFile, rm as rmFile } from 'node:fs/promises';
+import { cp, readdir, rm, mkdtemp, readFile, rm as rmFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -62,7 +62,8 @@ test('fixes a boundary on an object field and raises the score', async (t) => {
     command: project.runner.command,
     maxMutations: 12,
   });
-  assert.ok(after.score > before.score, `score should improve: ${before.score} -> ${after.score}`);
+  assert.ok(after.score > before.score,
+    `score should improve: ${before.score} -> ${after.score}; files=${await readdir(join(dir, 'test'))}`);
 });
 
 test('the generated test spreads the object the tests already build', async (t) => {

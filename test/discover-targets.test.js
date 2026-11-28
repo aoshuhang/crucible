@@ -241,7 +241,7 @@ test('rust integration tests map to the crate root', async (t) => {
     'use sample::twice;\n#[test]\nfn doubles() { assert_eq!(twice(2), 4); }\n', 'utf8');
 
   const projectInfo = await discover(dir);
-  assert.ok(projectInfo.testFiles.some((file) => file.endsWith('tests/integration.rs')));
+  assert.ok(projectInfo.testFiles.some((file) => file.replace(/\\/g, '/').endsWith('tests/integration.rs')));
   assert.deepEqual(projectInfo.covers.get(join(dir, 'src/lib.rs')),
     [join(dir, 'tests/integration.rs')]);
 });
@@ -288,7 +288,7 @@ test('test support, examples and tooling are not counted as product source', asy
   assert.ok(!names.includes('server.ts'));
   assert.ok(!names.includes('app.ts'), 'sample applications are not product source');
   assert.ok(!names.includes('playwright.config.js'));
-  assert.ok(projectInfo.testFiles.some((file) => file.endsWith('tests/a.test.js')),
+  assert.ok(projectInfo.testFiles.some((file) => file.replace(/\\/g, '/').endsWith('tests/a.test.js')),
     'test file discovery is unaffected');
 });
 
