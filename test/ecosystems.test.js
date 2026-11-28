@@ -39,6 +39,20 @@ test('maps a Go test to its sibling source without imports', async (t) => {
   assert.equal(covering.length, 1, 'decode_test.go must be mapped to decode.go');
 });
 
+test('a Go package test covers every non-test file in that package', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-go-package-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, 'go.mod'), 'module example.com/x\n');
+  await writeFile(join(dir, 'binding.go'), 'package x\nfunc Bind() {}\n');
+  await writeFile(join(dir, 'form.go'), 'package x\nfunc Form() {}\n');
+  await writeFile(join(dir, 'binding_test.go'), 'package x\nfunc TestBind(t *T) { Bind(); Form() }\n');
+
+  const p = await discover(dir);
+  assert.equal(p.covers.get(join(dir, 'binding.go')).length, 1);
+  assert.equal(p.covers.get(join(dir, 'form.go')).length, 1,
+    'Go compiles all package files into the same test binary');
+});
+
 test('recognises Rust test files', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'crucible-rs-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

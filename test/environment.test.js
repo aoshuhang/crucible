@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { environmentalNoise } from '../src/judge.js';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { environmentalNoise, baseline } from '../src/judge.js';
+import { shQuote } from '../src/paths.js';
 
 /**
  * A non-zero exit is not always a failing test.
@@ -27,6 +31,27 @@ Please run the following command to download new browsers: npx playwright instal
  Test Files  133 passed (189)
       Tests  2554 passed | 2 skipped (2556)
 `;
+
+test('a Go dependency download timeout is missing dependencies, not a red suite', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-go-network-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const script = join(dir, 'go-fail.js');
+  await writeFile(script, [
+    "console.error('go: downloading example.com/dep v1.0.0');",
+    "console.error('dial tcp 203.0.113.1:443: i/o timeout');",
+    "console.error('FAIL example.com/x [setup failed]');",
+    'process.exit(1);',
+  ].join('\n'), 'utf8');
+
+  const result = await baseline({
+    root: dir,
+    command: `${shQuote(process.execPath)} ${shQuote(script)}`,
+    timeoutMs: 20_000,
+  });
+
+  assert.equal(result.missing, true);
+  assert.match(result.hint, /GOPROXY|dependencies/i);
+});
 
 test('recognises a missing browser', () => {
   const noise = environmentalNoise(AXIOS_OUTPUT);

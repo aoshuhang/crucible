@@ -13,7 +13,7 @@
 import { exec } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { rmSync, writeFileSync } from 'node:fs';
-import { mutationsFor, applyMutation } from './mutate.js';
+import { mutationsDetailed, applyMutation } from './mutate.js';
 import { relPosix, baseName, shQuote } from './paths.js';
 
 /**
@@ -135,6 +135,138 @@ export function run(command, cwd, timeoutMs = 120_000) {
   });
 }
 
+/** Boolean options we can preserve without guessing. Anything else is a value. */
+const RUNNER_BOOLEAN_FLAGS = new Set([
+  '--ci', '--watch', '--watchAll', '--watch-all', '--runInBand', '--run-in-band',
+  '--verbose', '--silent', '--coverage', '--passWithNoTests', '--pass-with-no-tests',
+  '--updateSnapshot', '--update-snapshots', '-u', '--onlyChanged', '--only-changed',
+  '--changed', '--fail-fast', '--failFast', '--bail', '--no-cache', '--clearCache',
+  '--clear-cache', '--single-threaded', '--no-file-parallelism',
+  '--experimental-require-module', '--serial', '--tap', '--no-color', '--color',
+]);
+
+/** Options that take the following token as their value, for the JS runners. */
+const RUNNER_VALUE_FLAGS = new Set([
+  '--config', '-c', '--environment', '--env', '--mode', '--root', '--dir',
+  '--reporter', '--reporters', '--outputFile', '--output-file',
+  '--testNamePattern', '-t', '--test-name-pattern', '--project', '--workspace',
+  '--shard', '--pool', '--maxWorkers', '--minWorkers', '--max-workers',
+  '--min-workers', '--testTimeout', '--test-timeout', '--hookTimeout',
+  '--hook-timeout', '--retry', '--setupFiles', '--setup-files',
+  '--globalSetup', '--global-setup', '--testEnvironment', '--testEnvironmentOptions',
+  '--testMatch', '--testRegex', '--transform', '--moduleNameMapper',
+  '--moduleDirectories', '--roots', '--projects', '--selectProjects',
+  '--coverageDirectory', '--coverageReporters', '--match',
+  '--timeout', '--concurrency',
+]);
+
+/**
+ * Replace only the old test paths in a JS runner command. Rebuilding the command
+ * used to drop `--config`, `--environment` and every other project-specific flag,
+ * so the narrowed run could use a different environment than the baseline.
+ */
+export function preserveRunnerFlags(command, runner, quotedTests) {
+  const tokens = command.match(/(?:'[^']*'|"[^"]*"|\S+)/g) ?? [];
+  const runnerIndex = tokens.findIndex((token) => {
+    const bare = token.replace(/^['"]|['"]$/g, '');
+    return bare === runner || bare.endsWith(`/.bin/${runner}`);
+  });
+  if (runnerIndex === -1) return null;
+
+  const prefixHasDownloadTool = tokens.slice(0, runnerIndex)
+    .some((token) => /(?:^|\/)(?:npx|bunx)$/.test(token.replace(/^['"]|['"]$/g, '')));
+  const out = prefixHasDownloadTool
+    ? [`./node_modules/.bin/${runner}`]
+    : tokens.slice(0, runnerIndex + 1);
+
+  for (let i = runnerIndex + 1; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    const bare = token.replace(/^['"]|['"]$/g, '');
+    if (bare === 'run' && runner === 'vitest') { out.push(token); continue; }
+    if (bare === '--') break;
+    if (bare.startsWith('-')) {
+      // An unrecognised flag could take the next token as its value. Dropping
+      // that value silently would run the mutation under different settings, so
+      // refuse to narrow instead and let the caller use the full command.
+      if (!bare.includes('=') && !RUNNER_VALUE_FLAGS.has(bare) && !RUNNER_BOOLEAN_FLAGS.has(bare)
+        && bare !== '--bail') return null;
+      out.push(token);
+      const takesValue = !bare.includes('=') && (RUNNER_VALUE_FLAGS.has(bare)
+        // `--bail` optionally takes a number; the next token may be an old path.
+        || (bare === '--bail' && /^\d+$/.test(tokens[i + 1] ?? '')));
+      if (takesValue && i + 1 < tokens.length) {
+        out.push(tokens[i + 1]);
+        i += 1;
+      }
+      continue;
+    }
+    // Any remaining positional is an old test glob/path/filter. It is replaced,
+    // never appended alongside the new paths.
+  }
+
+  if (runner === 'jest' && !out.includes('--ci')) out.push('--ci');
+  out.push(quotedTests);
+  return out.join(' ');
+}
+
+const GO_BOOLEAN_FLAGS = new Set([
+  '-v', '-race', '-x', '-n', '-work', '-benchmem', '-failfast', '-json', '-short',
+  '-cover', '-msan', '-asan', '-trimpath', '-buildvcs',
+]);
+
+const GO_VALUE_FLAGS = new Set([
+  '-tags', '-ldflags', '-gcflags', '-asmflags', '-mod', '-modfile', '-overlay',
+  '-p', '-parallel', '-run', '-bench', '-benchtime', '-count', '-cpu', '-timeout',
+  '-vet', '-exec', '-o', '-coverprofile', '-covermode', '-coverpkg', '-shuffle',
+]);
+
+function preserveGoFlags(command, dirs) {
+  const tokens = command.match(/(?:'[^']*'|"[^"]*"|\S+)/g) ?? [];
+  const go = tokens.findIndex((token, index) => token === 'go' && tokens[index + 1] === 'test');
+  if (go === -1) return null;
+
+  const out = tokens.slice(0, go + 2);
+  let failFast = /-failfast\b/.test(command);
+  for (let i = go + 2; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (!token.startsWith('-')) continue; // the old package pattern
+    if (!token.includes('=') && !GO_VALUE_FLAGS.has(token) && !GO_BOOLEAN_FLAGS.has(token)) {
+      return null;
+    }
+    out.push(token);
+    if (token === '-failfast') failFast = true;
+    if (!token.includes('=') && GO_VALUE_FLAGS.has(token) && i + 1 < tokens.length) {
+      out.push(tokens[i + 1]);
+      i += 1;
+    }
+  }
+  if (!failFast) out.push('-failfast');
+  for (const dir of dirs) out.push(shQuote(dir === '.' ? '.' : `./${dir}`));
+  return out.join(' ');
+}
+
+const CARGO_VALUE_FLAGS = new Set([
+  '--features', '-F', '--package', '-p', '--target', '--profile', '--bin',
+  '--example', '--config', '-Z', '--jobs', '-j', '--manifest-path',
+]);
+
+function cargoTestPrefix(command) {
+  const tokens = command.match(/(?:'[^']*'|"[^"]*"|\S+)/g) ?? [];
+  const cargo = tokens.findIndex((token, index) => token === 'cargo' && tokens[index + 1] === 'test');
+  if (cargo === -1) return null;
+  const out = tokens.slice(0, cargo + 2);
+  for (let i = cargo + 2; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (!token.startsWith('-')) continue; // test-name filter / old target
+    out.push(token);
+    if (!token.includes('=') && CARGO_VALUE_FLAGS.has(token) && i + 1 < tokens.length) {
+      out.push(tokens[i + 1]);
+      i += 1;
+    }
+  }
+  return out.join(' ');
+}
+
 /**
  * Narrow the test command to only the files that cover this source.
  *
@@ -168,14 +300,11 @@ export function narrowCommand({ command, testFiles, root }) {
 
   const quoted = rels.map((r) => shQuote(r)).join(' ');
 
-  if (/node_modules\/\.bin\/vitest|vitest run/.test(command)) {
-    return addFailFast(`./node_modules/.bin/vitest run ${quoted}`);
-  }
-  if (/node_modules\/\.bin\/jest|jest --ci/.test(command)) {
-    return addFailFast(`./node_modules/.bin/jest ${quoted} --ci`);
-  }
-  if (/node_modules\/\.bin\/ava|\bava\b/.test(command)) {
-    return addFailFast(`./node_modules/.bin/ava ${quoted}`);
+  const nodeRunner = command.match(/(?:^|\s)(?:\.\/)?node_modules\/\.bin\/(vitest|jest|ava)\b|\b(vitest|jest|ava)\b/);
+  const runner = nodeRunner?.[1] ?? nodeRunner?.[2];
+  if (runner) {
+    const narrowed = preserveRunnerFlags(command, runner, quoted);
+    if (narrowed) return addFailFast(narrowed);
   }
   // `node --test` with a loader or import hook (`--import tsx`) only understands
   // the project's files with that flag, so the narrowed command must keep its
@@ -215,26 +344,29 @@ export function narrowCommand({ command, testFiles, root }) {
   }
 
   // Go: a mutation in a package can only be noticed by that package's tests, so
-  // narrow to the directories containing the covering `_test.go` files.
+  // narrow to the directories containing the covering `_test.go` files. Preserve
+  // build flags: `-race`, `-tags` and `-mod` can change which tests compile or run.
   if (/\bgo test\b/.test(command)) {
     const dirs = [...new Set(rels.map((rel) => {
       const cut = rel.lastIndexOf('/');
       return cut === -1 ? '.' : rel.slice(0, cut);
     }))];
     if (dirs.length <= 40) {
-      const targets = dirs.map((dir) => shQuote(dir === '.' ? '.' : `./${dir}`)).join(' ');
-      return `go test -failfast ${targets}`;
+      const narrowed = preserveGoFlags(command, dirs);
+      if (narrowed) return addFailFast(narrowed);
     }
     return base;
   }
 
   // Cargo: only integration test targets in tests/ can be named; unit tests inside
-  // src/ belong to the crate target and cannot be selected this way.
+  // src/ belong to the crate target and cannot be selected this way. Keep feature,
+  // target and profile flags from the original command.
   if (/\bcargo test\b/.test(command)) {
     const inTests = rels.filter((rel) => rel.startsWith('tests/'));
     const targets = [...new Set(inTests.map((rel) => rel.slice('tests/'.length).replace(/\.[^.]+$/, '')))];
     if (targets.length > 0 && targets.length === rels.length && targets.length <= 20) {
-      return targets.map((name) => `cargo test --test ${shQuote(name)}`).join(' && ');
+      const prefix = cargoTestPrefix(command);
+      if (prefix) return targets.map((name) => `${prefix} --test ${shQuote(name)}`).join(' && ');
     }
     return base;
   }
@@ -413,7 +545,13 @@ export async function baseline({ root, command, timeoutMs = 180_000 }) {
   const result = await run(command, root, timeoutMs);
   const output = result.stdout + result.stderr;
 
-  const missing = result.code === 127
+  // Go's module fetch errors are not test failures. Without this branch a network
+  // timeout was reported as "suite is red", sending the user to look for a broken
+  // test that does not exist.
+  const dependencyFetchFailure = /go: downloading|\[setup failed\]/i.test(output)
+    && /i\/o timeout|connection refused|dial tcp|TLS handshake timeout|proxy\.golang\.org|goproxy/i.test(output);
+  const missing = dependencyFetchFailure
+    || result.code === 127
     || /command not found|No module named|not found in \$PATH|cannot find package/i.test(output)
     // `npx --no-install` refuses when the binary is not in node_modules, which is
     // what a fresh clone looks like before `npm install`.
@@ -426,9 +564,11 @@ export async function baseline({ root, command, timeoutMs = 180_000 }) {
       ms: result.ms,
       command,
       output: output.slice(-1500),
-      hint: /missing packages/i.test(output)
-        ? `dependencies are not installed. Run the project's install step (npm install / pnpm install / pip install -e .) and try again.`
-        : `the test runner is not installed: \`${command}\` could not run. Install its dependencies, then try again.`,
+      hint: dependencyFetchFailure
+        ? 'Go dependencies could not be downloaded. Set a reachable GOPROXY (for example `GOPROXY=https://goproxy.cn,direct go mod download`) and try again.'
+        : /missing packages/i.test(output)
+          ? `dependencies are not installed. Run the project's install step (npm install / pnpm install / pip install -e .) and try again.`
+          : `the test runner is not installed: \`${command}\` could not run. Install its dependencies, then try again.`,
     };
   }
 
@@ -608,7 +748,8 @@ function pickSpread(list, slots, into) {
  */
 export async function auditFile({ root, file, command, maxMutations = 12, profile = 'logic', testFiles, timeoutMs = 120_000, onProgress }) {
   const source = await readFile(file, 'utf8');
-  const all = mutationsFor(source, file, { profile });
+  const detail = mutationsDetailed(source, file, { profile });
+  const all = detail.mutations;
   const picked = selectMutations(all, maxMutations);
 
   // Run only the tests that cover this file. On a large project this is the
@@ -635,6 +776,8 @@ export async function auditFile({ root, file, command, maxMutations = 12, profil
     file,
     total: results.length,
     available: all.length,
+    parseError: detail.parseError ?? null,
+    language: detail.language ?? null,
     killed: killed.length,
     survived: survivors.length,
     errored: errored.length,

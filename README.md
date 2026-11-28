@@ -1,11 +1,12 @@
 # crucible
 
-> **Status: 0.2.0, early.** Built and tested against six real projects on macOS.
-> When it cannot determine something it refuses and says why, rather than guessing —
-> that is the main design goal, because a wrong test-quality score is worse than no
-> score. Expect rough edges anyway. Windows is exercised in CI but still
-> experimental (see [Platforms](#platforms)). See [CHANGELOG.md](CHANGELOG.md).
-> Counter-examples and bug reports are genuinely useful.
+> **Status: 0.4.0, early.** Built and tested against six real projects on macOS.
+> A score is labelled `complete` or `sampled`, and a generated test is only
+> `repaired` after its target mutation is killed. When crucible cannot determine
+> something it refuses and says why, because a wrong test-quality score is worse
+> than no score. Windows is exercised in CI but still experimental (see
+> [Platforms](#platforms)). See [CHANGELOG.md](CHANGELOG.md). Counter-examples and
+> bug reports are genuinely useful.
 
 **Find the tests that cannot fail. Then fix them.**
 
@@ -19,8 +20,9 @@ crucible scan      # slower — break the source, find untested boundaries
 crucible fix       # write the boundary tests that were missing
 ```
 
-Works on any project with a test suite. No config file, no dependencies, no
-account.
+Works on any project with a test suite. No config file, no account. The npm
+package has one runtime dependency (`@babel/parser`) for real JS/TS/JSX syntax;
+Python analysis uses the interpreter's own standard-library AST.
 
 ---
 
@@ -57,7 +59,9 @@ npm link          # puts `crucible` on your PATH
 crucible check ~/code/my-project
 ```
 
-Requires Node 20 or newer. Nothing else.
+Requires Node 20 or newer. Python projects need `python3` (or `python` on
+Windows, or `CRUCIBLE_PYTHON`) and pytest; no Python packages are installed by
+crucible.
 
 ### As an agent skill
 
@@ -170,7 +174,8 @@ Tests that do not check values (6)
   ...
 
 0 tests cannot fail, 4 untested edges, 6 do not check values
-mutation score 31% across 4 files
+sampled mutation score 31% across 4 files · 48/611 mutants
+This is a sample. For a complete gate run: --select=all --limit=all --mutations=all.
 ```
 
 ## What it fixes
@@ -194,11 +199,13 @@ describe('limits.isFull at the MAX boundary', () => {
 
 Pinning `isFull(5)` looks responsible and catches nothing — 5 is nowhere near the
 threshold, so `>=` and `>` behave identically. Calling at 9, 10 and 11 is what
-makes an off-by-one fail. On the fixture project this takes the mutation score
-from 0% to 100%.
+makes an off-by-one fail.
 
-It verifies before claiming: the suite must still be green after writing, and
-`crucible verify` re-runs the audit so you see the score, not a promise.
+It verifies before claiming. First, the suite must still be green after writing.
+Then `fix` replays each target mutation: the generated boundary is only reported
+as `repaired` when that exact mutant is killed. A green suite alone is reported as
+unproven, never as a successful repair. `crucible verify` re-runs the audit for
+the overall score.
 
 ## Two kinds of finding, graded honestly
 
@@ -207,12 +214,13 @@ that "fake" would be a lie, so findings are graded:
 
 | grade | meaning | example |
 |---|---|---|
-| **certain** | provable by reading one line | `expect(true).toBe(true)`, no assertion, empty `catch`, mocking the unit under test, skipped test |
+| **certain** | provable by reading one line | `expect(true).toBe(true)`, an empty test, mocking the only local module under test |
 | **likely** | a deliberate break went unnoticed | `>=` → `>` in a comparison with no edge case |
-| **suspect** | tests do pin values; may be intentional | a range/continuity property test |
+| **suspect** | may be intentional | a property test, an explicit no-throw smoke test, a test skipped because an external service is unavailable |
 
-Only the first two drive the headline count. The third is listed separately and
-never counted as a fake test.
+Only the first two drive the headline count. `suspect` is listed separately and
+never counted as a fake test. In particular, an intentionally skipped integration
+test is not treated as a certain defect.
 
 ## Commands
 
@@ -220,7 +228,7 @@ never counted as a fake test.
 |---|---|---|
 | `crucible check [path]` | **0.1s** | reads the test files, finds the ones that cannot fail. No tests are executed. |
 | `crucible scan [path]` | seconds–minutes | mutates the source, finds boundaries no test covers |
-| `crucible fix [path]` | seconds | writes the boundary tests that were missing |
+| `crucible fix [path]` | seconds | attempts the missing boundary tests, then replays each target mutation |
 | `crucible verify [path]` | seconds–minutes | re-runs `scan` after a fix, to see the score move |
 | `crucible install` | instant | copies the agent skill into OpenCode and Claude Code |
 
@@ -235,8 +243,10 @@ PR. `fix` is what you run when `scan` finds something.
 
 | flag | applies to | effect |
 |---|---|---|
-| `--json` | all | machine-readable output, including a `next` block per finding and a `survivors` list per file |
-| `--limit=N` | scan, fix | audit at most N source files (default 12); files left out are named in the report |
+| `--json` | all | machine-readable output, including `next`, `sampling`, `scoreKind` and per-file `survivors` |
+| `--limit=N\|all` | scan, fix | audit at most N source files (default 12); `all` removes the cap; partial runs name what was left out |
+| `--mutations=N\|all` | scan | sample at most N mutants per file (default 12); `all` runs every generated mutant |
+| `--select=MODE` | scan | file selection: `files` (default), `changed`, `risk`, `all` |
 | `--jobs=N` | scan | parallel sandbox workers (default `min(4, cpus)`; `1` mutates in place) |
 | `--no-cache` | scan | ignore the incremental results cache |
 | `--fail-under=N` | scan | exit 1 when the mutation score is below N percent |
@@ -251,7 +261,11 @@ PR. `fix` is what you run when `scan` finds something.
 
 `check` and `scan` exit 1 when something is certainly wrong — including a mutation
 score below `--fail-under` — and 2 when the audit could not run at all (no runner,
-red suite). That is all a pre-commit hook or a CI step needs:
+red suite). A sampled score's gate message always states the audited files and
+mutants; for a release gate use `--limit=all --mutations=all` to obtain
+`scoreKind: "complete"`. A parse failure, errored mutant or skipped file prevents
+a complete label; `sampling.filesIncomplete` says how many files were affected. That is all a pre-commit
+hook or a CI step needs:
 
 ```bash
 # .git/hooks/pre-commit
@@ -275,16 +289,22 @@ Detected automatically, no configuration:
 - **swift test**
 
 `scan` works on all of them, and narrows the test command to the covering files
-for vitest, jest, ava, `node --test`, pytest, Go and Cargo. `fix` writes JS/TS
-(including TypeScript boundary tests, which run through the project's own runner)
-and pytest code; the others are detected and mutated but their repair still needs
-a hand-written test. `check` analyses JavaScript/TypeScript test bodies and Python
-`def test_*` functions.
+for vitest, jest, ava, `node --test`, pytest, Go and Cargo, preserving the
+project's config/build flags. Unknown flags fall back to the full command rather
+than silently changing the environment. `fix` writes JS/TS (including TypeScript
+boundary tests, which run through the project's own runner) and pytest code; the
+others are detected and mutated but their repair still needs a hand-written test.
+CommonJS modules can be audited but are not auto-fixed. `check` analyses
+JavaScript/TypeScript test bodies and Python `def test_*` functions.
 
-Source files are matched to tests by resolving imports, by Go's `foo_test.go`
-sibling convention, and — as a fallback — by basename reference. A file with no
-covering test is reported as *untested*, which is a different problem and is not
-counted as a fake test.
+Source files are matched to tests by resolving imports (including tsconfig path
+aliases and workspace packages), by Python package/`src` layout, by Go package
+tests and by Rust's `tests/*.rs` convention. Imported barrel/package entries are
+followed transitively, so a test of `src/index.ts` covers the modules it loads.
+A basename mention is shown only as an unverified hint. A file with no covering
+test is reported as *untested*, which is a different problem and is not counted
+as a fake test. Test support, examples, sample apps, benchmarks and docs are not
+treated as product source.
 
 **Monorepos.** A workspace root usually declares packages but does not have the
 runner installed itself. `scan` detects npm/yarn workspaces and
@@ -337,8 +357,37 @@ version reported 282 problems in p-map alone, all of them well-written ava tests
 The known-bad sample is the control: one test that calls `clamp()` and asserts
 nothing, correctly reported.
 
-`scan` also produces a mutation score on the slow path. chalk scores 92% (94% on a
-full run), slugify 91%, and a 5k-line game prototype 52%.
+The 0.4 audit added larger, structurally different projects:
+
+| project | test files | **certain findings** | what they are |
+|---|---|---|---|
+| **NestJS** | 695 | **1** | one upstream test calls `publish()` and asserts nothing |
+| **Vue** | 208 | **2** | one assertion is commented out; one test only constructs components |
+| **Flask** | 27 | **0** | — |
+| **Django** | 653 | **0** | after fixing Python docstring/Unicode masking and TestCase helpers |
+| **Click** | 43 | **0** | Python pytest |
+| **FastAPI** | 567 | **0** | tutorial wrapper/helper delegation recognised |
+| **Zod** | 205 | **9** | 5 empty placeholders + 4 literal tautologies, all real upstream |
+| **React** | 597 | **4** | one empty test + three literal placeholders, all real upstream |
+| **SQLAlchemy** | 241 | **2** | one pass-only placeholder + one query smoke test |
+| **Gin** | 40 | **0** | Go-only project; discovery and mutation scan verified |
+| **Next.js snapshot** | 858 | **0** | partial snapshot used for parser stress only |
+
+Real-project runs found and fixed repeated false-positive classes: awaited promise
+assignments, TypeScript `@ts-expect-error`/`satisfies` assertions, nested
+test-named route handlers, collaborator mocks, custom test decorators, Python
+docstring/Unicode masking, Django TestCase helpers, Go build-tag-excluded files
+and non-asserting unittest smoke tests. Those cases are regression tests now.
+
+Mutation scans were also exercised on axios, Express, Lodash, NestJS, Flask, Gin,
+Click and FastAPI. The real projects are pinned in
+`.github/workflows/real-projects.yml`; the large static job covers NestJS, Vue,
+Django, Flask, Click, FastAPI and Zod.
+
+`scan` also produces a mutation score on the slow path. Those runs are samples
+unless `--mutations=all` is passed; the report and JSON state `scoreKind` and how
+many files and mutants were audited. chalk scored 92% sampled (94% full), slugify
+91%, and a 5k-line game prototype 52%.
 
 Full methodology, including the two occasions this tool reported a number that
 flattered the suite, is in [RELEASE.md](RELEASE.md).
@@ -429,11 +478,12 @@ Four things keep it usable:
   the project into temporary sandboxes and mutates them independently. Each copy
   must run the suite green once before any result from it is trusted; otherwise the
   audit falls back to mutating in place, sequentially. `--jobs=1` forces that path.
-- **Incremental cache.** Results are keyed by the source bytes, the covering-test
-  bytes, the command, the profile and the mutation cap, so re-auditing unchanged
-  files is near-instant. The cache lives in `node_modules/.cache/crucible` (or the
-  OS temp directory when there is no `node_modules`) and never in the repo root.
-  `--no-cache` ignores it.
+- **Incremental cache.** Results are keyed by the source bytes, covering-test
+  bytes, every source/test in the project (conservative transitive-dependency
+  invalidation), lockfiles, TypeScript config, test-runner config, runner command,
+  profile, mutation cap, Node version and platform. The cache lives in
+  `node_modules/.cache/crucible` (or the OS temp directory when there is no
+  `node_modules`) and never in the repo root. `--no-cache` ignores it.
 
 A 9-file audit of a 5k-line TypeScript game prototype took 70 seconds sequentially;
 the sandbox path scales with cores, and a second run over unchanged files does no
@@ -492,9 +542,21 @@ valuable bug you can file. Include the test file and the command output.
 ## Limits, stated plainly
 
 - **Boundaries on intermediate variables are reported, not fixed.** See above.
+- **Complex numeric signatures are not auto-fixed.** A threshold that is another
+  function parameter (`clamp(n, lo, hi)`) cannot be resolved from the source alone.
+  `fix` names those unresolved edges as manual work instead of pretending the file
+  is fully repaired.
 - **Equivalent mutants exist.** Bumping a config constant that no test should pin
   produces a survivor that is not a defect. The tool filters loops, bitwise tricks
   and shifts, but it cannot prove equivalence in general.
+- **Go build constraints are evaluated for the current machine.** Files excluded
+  by their `//go:build` expression are not mutated. Custom tags passed through
+  `-tags` are not guessed, so a tag-specific CI build should be audited with that
+  build's environment.
+- **Basename-only coverage is a hint, not a score.** Modern aliases, workspaces,
+  Python src layouts, Go siblings and Rust integration tests are resolved. A bare
+  name mention in executable code is reported separately and never drives mutation
+  scores.
 - **Parallelism needs a copyable project.** Sandbox mode copies the tree (excluding
   `node_modules` and `.git`) and links dependencies. A project whose tests depend on
   `.git`, absolute paths, or writing into the repo may behave differently in a
@@ -507,8 +569,9 @@ valuable bug you can file. Include the test file and the command output.
 - **No discoverable test script means refusal, not a guess.** A wrong score is worse
   than no score.
 - **CommonJS modules are scanned but not auto-fixed.** `fix` recognises ESM and
-  Python exports; a file that only assigns `module.exports` is audited normally but
-  gets no generated test. Write that one by hand, or convert it to ESM.
+  module-level Python functions; a file that only assigns `module.exports` is
+  audited normally but gets no generated test. Write that one by hand, or convert
+  it to ESM. Python class methods are likewise reported but not auto-fixed.
 
 ## When the suite fails for a reason that is not your code
 

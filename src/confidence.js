@@ -31,7 +31,6 @@ const CERTAIN_IDS = new Set([
   'assert-true-literal',
   'no-assertion',
   'mock-self',
-  'skipped',
   'expect-in-callback-not-awaited',
 ]);
 
@@ -40,6 +39,10 @@ const SUSPECT_IDS = new Set([
   'not-null-only',
   'truthy-only',
   'type-only',
+  // A skipped test cannot fail, but real projects skip integration tests when an
+  // external service is unavailable. That is not evidence of a fake test and must
+  // not drive the CI exit code.
+  'skipped',
   // An empty catch inside a test file is often deliberate: a feature probe, an
   // optional cleanup, a tolerant resolution like lodash's
   // `try { realpathSync(p) } catch {}`. It only matters on the assertion path, and
@@ -52,7 +55,9 @@ export function gradeFinding(finding) {
   // A test that runs several statements but asserts nothing is not provably fake: it
   // may be a smoke test that fails when the code throws. Keep it in the report, out
   // of the certain count.
-  if (finding.id === 'no-assertion' && finding.thin) return CONFIDENCE.SUSPECT;
+  if (finding.id === 'no-assertion' && (finding.thin || finding.smoke)) {
+    return CONFIDENCE.SUSPECT;
+  }
 
   if (CERTAIN_IDS.has(finding.id)) return CONFIDENCE.CERTAIN;
   if (SUSPECT_IDS.has(finding.id)) return CONFIDENCE.SUSPECT;

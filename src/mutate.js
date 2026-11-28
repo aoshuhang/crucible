@@ -11,6 +11,11 @@
  * formatting or comments proves nothing.
  */
 
+import { isJsFile, validateSource } from './js-ast.js';
+import { jsMutationsDetailed } from './js-mutate.js';
+import { pythonMutationsDetailed } from './python-mutate.js';
+import { goSourceIsActive } from './go-build.js';
+
 /** @typedef {{ id: string, kind: string, line: number, column: number, original: string, mutated: string, description: string }} Mutation */
 
 /**
@@ -337,6 +342,30 @@ function findTernary(masked) {
  * @returns {Mutation[]}
  */
 export function mutationsFor(source, fileLabel = 'source', options = {}) {
+  return mutationsDetailed(source, fileLabel, options).mutations;
+}
+
+/**
+ * Mutation generation with an explicit failure state.
+ * JS/TS and Python use their language parsers. Other languages retain the
+ * conservative lexical operators and are identified in the report.
+ */
+export function mutationsDetailed(source, fileLabel = 'source', options = {}) {
+  if (isJsFile(fileLabel)) return jsMutationsDetailed(source, fileLabel, options);
+  if (/\.py$/i.test(fileLabel)) return pythonMutationsDetailed(source, fileLabel, options);
+  if (/\.go$/i.test(fileLabel) && !goSourceIsActive(source)) {
+    return {
+      mutations: [],
+      parseError: null,
+      available: 0,
+      language: 'go',
+      skippedReason: 'the file is excluded from the current build by a //go:build constraint',
+    };
+  }
+  return { mutations: lexicalMutations(source, fileLabel, options), parseError: null, available: null, language: 'lexical' };
+}
+
+function lexicalMutations(source, fileLabel = 'source', options = {}) {
   const profile = options.profile ?? 'logic';
   const strict = profile === 'strict';
 
@@ -470,8 +499,8 @@ export function mutationsFor(source, fileLabel = 'source', options = {}) {
     //    RAW line inside the delimiters is still correct here.
     const strings = /(['"])((?:\\.|(?!\1).)*)\1/g;
     let strMatch;
-    while ((strMatch = strings.exec(raw)) !== null) {
-      const content = strMatch[2];
+    while ((strMatch = strings.exec(masked)) !== null) {
+      const content = raw.slice(strMatch.index + 1, strMatch.index + strMatch[0].length - 1);
       if (content.length === 0) continue;
       if (content.length > 40) continue;
       // Skip module specifiers and obvious paths.
@@ -518,7 +547,7 @@ export const operators = {
  * Parse-check a JavaScript source text WITHOUT executing it, using `new Function`.
  *
  * `new Function(body)` compiles the body and throws only on SyntaxError; it never
- * runs the code. This is the zero-dependency syntax gate for generated mutants:
+ * runs the code. This is the syntax gate for generated mutants without a filename:
  * a mutant that cannot parse is a guaranteed test failure for reasons that have
  * nothing to do with test quality, and counting it as KILLED inflates the score.
  *
@@ -535,12 +564,9 @@ export function parsesAsScript(source, file = null) {
   if (!Number.isFinite(nodeMajor)) return null;
   if (nodeMajor < 20) return null;
 
-  // .mjs/.cjs/.js are JavaScript by definition. Anything else (TS, JSX, unknown,
-  // or no file hint) is skipped: a false "does not parse" would silently remove
-  // mutations from the audit.
-  let ext = null;
-  if (typeof file === 'string' && file.includes('.')) ext = file.slice(file.lastIndexOf('.')).toLowerCase();
-  if (!['.js', '.mjs', '.cjs'].includes(ext)) return null;
+  // All JS/TS/JSX variants now have a real parser. The old `new Function` fallback
+  // is retained only for callers that pass a code fragment with no filename.
+  if (file) return validateSource(source, file) === null ? null : source;
 
   const body = source;
   const candidates = [];

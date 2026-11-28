@@ -64,15 +64,19 @@ test('code inside a template interpolation IS mutated', () => {
   const mutants = mutationsFor(src, 'x.js');
   assert.ok(mutants.some((m) => m.kind === 'comparison'),
     'the comparison inside ${...} is live code');
-  assert.ok(mutants.every((m) => m.description !== 'swap the ternary branches'),
-    'a ternary inside an interpolation cannot be swapped without breaking the template');
+  // The AST knows the expression span, so a branch swap inside `${...}` is now
+  // safe. Every candidate still has to parse as a complete module.
+  for (const mutation of mutants) {
+    assert.ok(parsesAsScript(applyMutation(src, mutation), 'x.js'), mutation.description);
+  }
 });
 
 test('parsesAsScript accepts real modules and rejects broken ones', () => {
   assert.notEqual(parsesAsScript('export const a = 1;\n', 'a.js'), null);
   assert.notEqual(parsesAsScript('const x = -1;\nconst y = a - b;\n', 'b.js'), null);
   assert.equal(parsesAsScript('const x = xs.map(x =>= 2);\n', 'c.js'), null);
-  assert.equal(parsesAsScript('let x: number = 1;', 'd.ts'), null, 'TS is not gated statically');
+  assert.notEqual(parsesAsScript('let x: number = 1;', 'd.ts'), null,
+    'TypeScript now has a real parser and valid TS must be accepted');
 });
 
 test('looksLikeSyntaxError recognises runner parse failures', () => {
@@ -290,8 +294,12 @@ test('fix --json prints a machine-readable report', async (t) => {
   assert.ok(stdout.trim().length > 0, 'fix --json must print something');
   const report = JSON.parse(stdout);
   assert.ok(Array.isArray(report.written));
-  assert.equal(typeof report.suiteGreen, 'boolean');
+  assert.equal(report.suiteGreen, true);
   assert.ok(report.next, 'the report must carry the next action');
+  assert.equal(report.repairs.length, report.written.length);
+  assert.equal(report.repairs[0].status, 'repaired',
+    'a written boundary must be replayed against its exact mutant');
+  assert.ok(report.repairs[0].verified > 0);
 });
 
 // ---------------------------------------------------------------------------

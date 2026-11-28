@@ -17,7 +17,7 @@
  * otherwise in the OS temp directory. Nothing is ever written into the repo root.
  */
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url';
  * Bump when `mutationsFor`, `selectMutations` or the judging rules change: an old
  * entry would otherwise claim a score the current version would not produce.
  */
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 
 /**
  * The published package version, mixed into every cache key.
@@ -65,17 +65,67 @@ export function cacheFileFor(root) {
 }
 
 /** A stable identity for one file's audit inputs. */
-export function cacheKey({ source, testContents = [], command, profile, maxMutations }) {
+export function cacheKey({ source, testContents = [], command, profile, maxMutations, workspace = '', environment = '' }) {
   const hash = createHash('sha256');
   hash.update(`v${CACHE_VERSION}\0`);
   hash.update(`${packageVersion()}\0`);
   hash.update(`${profile}\0${maxMutations}\0${command}\0`);
+  // Indirect dependencies and their test setup can change whether a mutant is
+  // killed. Hashing the complete source/test workspace is deliberately
+  // conservative: it may miss a cache hit, but it cannot return a stale score.
+  hash.update(environment);
+  hash.update('\0');
+  hash.update(workspace);
+  hash.update('\0');
   hash.update(source);
   for (const text of testContents) {
     hash.update('\0');
     hash.update(text);
   }
   return hash.digest('hex').slice(0, 32);
+}
+
+/**
+ * Hash all files that can influence an audit's result but are not the current
+ * source or its covering tests: every source/test in the project, lockfiles and
+ * TypeScript config. Node/platform are included because native behavior and
+ * runner output differ across them.
+ */
+export async function workspaceFingerprint(project) {
+  const hash = createHash('sha256');
+  hash.update(`${process.version}\0${process.platform}\0${process.arch}\0`);
+  const files = [...(project.sourceFiles ?? []), ...(project.testFiles ?? [])].sort();
+  for (const file of files) {
+    hash.update(file);
+    hash.update('\0');
+    try {
+      hash.update(await readFile(file));
+    } catch {
+      hash.update('<unreadable>');
+    }
+    hash.update('\0');
+  }
+  const fixed = ['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock',
+    'bun.lock', 'bun.lockb', 'tsconfig.json', 'jsconfig.json', 'pyproject.toml',
+    'pytest.ini', 'Cargo.toml', 'go.mod'];
+  const extras = [];
+  try {
+    const entries = await readdir(project.root, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (/^(?:vitest|vite|jest|playwright|babel)\.config\.[cm]?[jt]s$/.test(entry.name)
+        || /^\.babelrc/.test(entry.name)) extras.push(entry.name);
+    }
+  } catch { /* unreadable root already reported by discovery */ }
+
+  for (const name of [...new Set([...fixed, ...extras])].sort()) {
+    hash.update(name);
+    try {
+      hash.update(await readFile(join(project.root, name)));
+    } catch { /* absent is part of the environment */ }
+    hash.update('\0');
+  }
+  return hash.digest('hex');
 }
 
 /** @returns {Promise<{ file: string|null, entries: Record<string, object> }>} */
@@ -130,6 +180,8 @@ export function cacheableResult(result) {
     file: result.file,
     total: result.total,
     available: result.available,
+    parseError: result.parseError ?? null,
+    language: result.language ?? null,
     killed: result.killed,
     survived: result.survived,
     errored: result.errored,

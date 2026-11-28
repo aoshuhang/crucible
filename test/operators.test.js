@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mutationsFor } from '../src/mutate.js';
-import { selectMutations, narrowCommand } from '../src/judge.js';
+import { selectMutations, narrowCommand, addFailFast } from '../src/judge.js';
 
 // ---------------------------------------------------------------------------
 // Profiles: tuning constants are not a test-quality signal.
@@ -179,6 +179,38 @@ test('narrows a vitest command to the covering tests', () => {
   assert.match(cmd, /tests\/b\.test\.ts/);
 });
 
+test('narrowing preserves config and environment flags', () => {
+  const cmd = narrowCommand({
+    command: './node_modules/.bin/vitest run --config config/vitest.integration.js --environment jsdom --retry 2 "test/*.test.ts"',
+    testFiles: ['/r/test/cart.test.ts'],
+    root: '/r',
+  });
+  assert.match(cmd, /--config config\/vitest\.integration\.js/);
+  assert.match(cmd, /--environment jsdom/);
+  assert.match(cmd, /--retry 2/);
+  assert.match(cmd, /test\/cart\.test\.ts/);
+  assert.doesNotMatch(cmd, /test\/\*\.test\.ts/, 'the old glob must be replaced');
+});
+
+test('narrowing a jest command keeps its project configuration', () => {
+  const cmd = narrowCommand({
+    command: './node_modules/.bin/jest --ci --config jest.integration.js --runInBand test/old.test.js',
+    testFiles: ['/r/test/cart.test.js'],
+    root: '/r',
+  });
+  assert.match(cmd, /--config jest\.integration\.js/);
+  assert.match(cmd, /--runInBand/);
+  assert.match(cmd, /test\/cart\.test\.js/);
+  assert.doesNotMatch(cmd, /old\.test\.js/);
+});
+
+test('an unknown runner flag falls back to the full command instead of dropping its value', () => {
+  const full = './node_modules/.bin/vitest run --exotic-option ./config.json test/*.test.js';
+  const cmd = narrowCommand({ command: full, testFiles: ['/r/test/cart.test.js'], root: '/r' });
+  assert.equal(cmd, addFailFast(full),
+    'keeping the original command may be slower, but it cannot silently use different settings');
+});
+
 test('narrows a node --test command', () => {
   const cmd = narrowCommand({
     command: 'node --test test/*.test.js',
@@ -221,6 +253,27 @@ test('falls back to the full command past the argv limit', () => {
   const full = 'node --test';
   const tooMany = Array.from({ length: 45 }, (_, i) => `/r/t${i}.test.js`);
   assert.equal(narrowCommand({ command: full, testFiles: tooMany, root: '/r' }), full);
+});
+
+test('go narrowing keeps race and build tags', () => {
+  const cmd = narrowCommand({
+    command: 'go test -race -tags integration ./...',
+    testFiles: ['/r/pkg/cart/cart_test.go'],
+    root: '/r',
+  });
+  assert.match(cmd, /go test -race -tags integration/);
+  assert.match(cmd, /-failfast/);
+  assert.match(cmd, /\.\/pkg\/cart/);
+  assert.doesNotMatch(cmd, /\.\/\.\.\./, 'the old package pattern must be replaced');
+});
+
+test('cargo narrowing keeps features and package flags', () => {
+  const cmd = narrowCommand({
+    command: 'cargo test --features full --package engine',
+    testFiles: ['/r/tests/cart.rs'],
+    root: '/r',
+  });
+  assert.match(cmd, /cargo test --features full --package engine --test cart/);
 });
 
 test('does not narrow a runner it cannot express safely', () => {

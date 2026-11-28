@@ -168,6 +168,43 @@ test('a rejects assertion without await is a finding', async () => {
   assert.equal(findings.filter((f) => f.id === 'expect-in-callback-not-awaited').length, 1);
 });
 
+test('a rejects promise assigned to a variable and awaited later is not a finding', async () => {
+  const { scanTestSource } = await import('../src/detect.js');
+  const sources = [
+    [
+      "it('closes during handshake', async () => {",
+      '  const stopped = expect(connection).rejects.toThrow("closed");',
+      '  await new Promise(process.nextTick);',
+      '  await stopped;',
+      '});',
+    ].join('\n'),
+    [
+      "it('closes with a wrapped assignment', async () => {",
+      '  const stopped =',
+      '    expect(connection).rejects.toThrow("closed");',
+      '  await stopped;',
+      '});',
+    ].join('\n'),
+  ];
+
+  for (const source of sources) {
+    const findings = scanTestSource(source, 'test/client.spec.ts', { mask: false });
+    assert.equal(findings.filter((f) => f.id === 'expect-in-callback-not-awaited').length, 0);
+  }
+});
+
+test('a TypeScript compile-time assertion counts as a test assertion', async () => {
+  const { scanTestSource } = await import('../src/detect.js');
+  const source = [
+    "it('enforces the generic contract', () => {",
+    '  // @ts-expect-error transform is required',
+    '  const decorator = createDecorator<string[], number>({});',
+    '});',
+  ].join('\n');
+  const findings = scanTestSource(source, 'test/reflector.spec.ts');
+  assert.equal(findings.filter((f) => f.id === 'no-assertion').length, 0);
+});
+
 test('an arrow that implicitly returns a rejects promise is not a finding', async () => {
   // axios has `const guard = (p) => expect(p).rejects.toMatchObject({...})` and
   // awaits the result at every call site.

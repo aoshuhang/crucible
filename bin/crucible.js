@@ -15,7 +15,7 @@
  *   crucible install        copy the agent skill into the agent's skill directory
  */
 
-import { readFile, writeFile, rm } from 'node:fs/promises';
+import { readFile, writeFile, rm, stat } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { homedir, availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -27,19 +27,22 @@ import {
   registerTempFile, unregisterTempFile, restoreFailuresSeen,
 } from '../src/judge.js';
 import { buildPlan, executePlan, finalizePlan } from '../src/audit.js';
-import { loadCache, saveCache, cacheKey, cacheableResult, isUsableResult } from '../src/cache.js';
+import { loadCache, saveCache, cacheKey, cacheableResult, isUsableResult, workspaceFingerprint } from '../src/cache.js';
 import { scanTestSource } from '../src/detect.js';
+import { mutationsDetailed } from '../src/mutate.js';
 import { gradeFinding, gradeSurvivor, hasValuePinningAssertions, headline, CONFIDENCE } from '../src/confidence.js';
 import { rankSurvivors } from '../src/boundary.js';
 import { exportedNames, harvestCallSites, buildProbe, buildValueProbe, parseProbeOutput,
   buildFixTest, placement } from '../src/fix.js';
 import { fixBoundaries } from '../src/fix-boundary.js';
-import { fixObjectBoundary } from '../src/fix-object.js';
+import { fixObjectBoundary, objectFileVariant } from '../src/fix-object.js';
 import { nextStepFor, planFor } from '../src/next.js';
 import { mapComparisonsToFunctions } from '../src/fix-boundary.js';
 import { mayWrite, stamp } from '../src/guard.js';
 import { relPosix, toPosix, shQuote, NEIGHBOUR_OPERATOR } from '../src/paths.js';
 import { installSkill, defaultSkillTargets } from '../src/install.js';
+import { validateGeneratedTest } from '../src/generated.js';
+import { verifyRepairs } from '../src/repair.js';
 
 const C = {
   reset: '\u001b[0m', dim: '\u001b[2m', bold: '\u001b[1m',
@@ -172,7 +175,23 @@ function positiveInt(flag, fallback) {
   return n;
 }
 
-const maxFiles = positiveInt('--limit', 12);
+function positiveIntOrAll(flag, fallback) {
+  const arg = argv.find((a) => a.startsWith(`${flag}=`));
+  if (!arg) return fallback;
+  const raw = arg.slice(flag.length + 1);
+  if (raw === 'all') return Infinity;
+  return positiveInt(flag, fallback);
+}
+
+const selectArg = argv.find((a) => a.startsWith('--select='));
+const selection = selectArg ? selectArg.slice('--select='.length) : 'files';
+if (!['files', 'changed', 'risk', 'all'].includes(selection)) {
+  console.error(`unknown --select mode: ${selection} (expected files, changed, risk or all)`);
+  process.exit(1);
+}
+
+const maxFiles = positiveIntOrAll('--limit', 12);
+const maxMutations = positiveIntOrAll('--mutations', 12);
 // Each job is a temporary sandbox copy, so more than the core count buys nothing.
 // `--jobs=1` keeps the in-place path when a copy is undesirable.
 const jobs = positiveInt('--jobs', Math.min(4, Math.max(1, availableParallelism())));
@@ -246,21 +265,56 @@ async function mutationPass(project, { onProgress } = {}) {
 
   // Saying nothing about the files `--limit` left out made a partial audit look
   // like a full one. The count is reported so a CI step or an agent can tell.
-  const covered = coveredAll.slice(0, maxFiles);
-  const notAudited = coveredAll.length - covered.length;
+  let ordered = coveredAll;
+  if (selection === 'changed') {
+    const times = await Promise.all(coveredAll.map(async (target) => {
+      try { return { ...target, mtime: (await stat(target.file)).mtimeMs }; } catch { return { ...target, mtime: 0 }; }
+    }));
+    times.sort((a, b) => b.mtime - a.mtime || (a.file < b.file ? -1 : 1));
+    ordered = times;
+  } else if (selection === 'risk') {
+    ordered = [...coveredAll].sort((a, b) => a.testFiles.length - b.testFiles.length
+      || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+  }
+  const effectiveLimit = selection === 'all' ? Infinity : maxFiles;
+  const covered = [];
+  let skippedEmpty = 0;
+  let notAudited = 0;
 
-  if (covered.length === 0) return { files: [], notAudited: 0 };
+  // Fill the requested slots with files that actually have mutations. A barrel
+  // index.js with only re-exports must not consume --limit=1 and leave the run
+  // with no score. Generation is still by language parser, never execution.
+  for (const target of ordered) {
+    if (covered.length >= effectiveLimit) break;
+    let source;
+    try {
+      source = await readFile(target.file, 'utf8');
+    } catch {
+      continue;
+    }
+    const detail = mutationsDetailed(source, target.file, { profile });
+    if (detail.mutations.length === 0 && !detail.parseError) {
+      skippedEmpty += 1;
+      continue;
+    }
+    covered.push({ ...target, source, detail });
+  }
+  notAudited = coveredAll.length - covered.length - skippedEmpty;
+
+  if (covered.length === 0) return { files: [], notAudited: 0, skippedEmpty };
 
   // An env-noise run audits a suite that did not fully start; caching those results
   // would let a later clean run reuse them.
   const useCache = !noCache && !allowEnvNoise;
   const cache = await loadCache(project.root, { enabled: useCache });
+  const workspace = useCache ? await workspaceFingerprint(project) : '';
+  const environment = `${process.version}|${process.platform}|${process.arch}`;
   const keys = new Map();
   const cachedResults = new Map();
   const misses = [];
 
   for (const target of covered) {
-    const source = await readFile(target.file, 'utf8');
+    const source = target.source;
     const testContents = await Promise.all(target.testFiles.map(async (tf) => {
       try { return await readFile(tf, 'utf8'); } catch { return ''; }
     }));
@@ -269,7 +323,9 @@ async function mutationPass(project, { onProgress } = {}) {
       testContents,
       command: project.runner.command,
       profile,
-      maxMutations: 12,
+      maxMutations,
+      workspace,
+      environment,
     });
     keys.set(target.file, key);
 
@@ -285,7 +341,7 @@ async function mutationPass(project, { onProgress } = {}) {
       targets: misses,
       command: project.runner.command,
       profile,
-      maxMutations: 12,
+      maxMutations,
     });
     await executePlan({
       root: project.root,
@@ -328,14 +384,17 @@ async function mutationPass(project, { onProgress } = {}) {
     // mutants, so they never drive the headline count or the exit code.
     const survivorFindings = ranked.map((s) => {
       if (s.boundary || s.threshold) {
+        const why = s.boundary
+          ? `no test supplies the equality edge: flipping ${s.mutation.original} to ${flipOf(s.mutation.original)} went unnoticed`
+          : `a threshold change went unnoticed: ${s.mutation.description}`;
         return {
-          id: 'untested-boundary',
+          id: s.boundary ? 'untested-boundary' : 'untested-threshold',
           file: rel,
           line: s.mutation.line,
           column: s.mutation.column ?? null,
           kind: 'boundary',
           snippet: s.described,
-          why: `no test covers the edge of this comparison: flipping ${s.mutation.original} to ${flipOf(s.mutation.original)} went unnoticed`,
+          why,
           fix: s.suggestion,
           confidence: CONFIDENCE.LIKELY,
         };
@@ -363,7 +422,7 @@ async function mutationPass(project, { onProgress } = {}) {
     });
   }
 
-  return { files, notAudited };
+  return { files, notAudited, skippedEmpty };
 }
 
 /**
@@ -512,6 +571,7 @@ async function cmdScan() {
 
   let mutationFiles = [];
   let notAudited = 0;
+  let skippedEmpty = 0;
   let base = null;
   let suiteError = null;
   let envNoise = null;
@@ -532,7 +592,7 @@ async function cmdScan() {
           // skipped so the report is not mistaken for a clean run.
           envNoise = base.detail;
         }
-        ({ files: mutationFiles, notAudited } = await mutationPass(project, {
+        ({ files: mutationFiles, notAudited, skippedEmpty } = await mutationPass(project, {
           onProgress: (m) => { if (verbose) say(`  ${C.dim}${m}${C.reset}`); },
         }));
       } else if (base.missing) {
@@ -544,6 +604,16 @@ async function cmdScan() {
       }
     }
   }
+
+  // Basename mentions are useful clues, but scoring them would audit code the
+  // test may never execute. Report them separately and never count them as covered.
+  const hints = [...project.covers.entries()]
+    .filter(([, tests]) => tests.length === 0)
+    .map(([source]) => ({
+      source: relPosix(project.root, source),
+      tests: (project.heuristicCovers?.get(source) ?? []).map((test) => relPosix(project.root, test)),
+    }))
+    .filter((hint) => hint.tests.length > 0);
 
   const allFindings = [
     ...staticFindings,
@@ -576,6 +646,28 @@ async function cmdScan() {
     : killedTotal / (killedTotal + survivedTotal);
   const scorePercent = pooledScore === null ? null : Math.round(pooledScore * 100);
 
+  const mutantsAvailable = mutationFiles.reduce((n, f) => n + (f.available ?? f.total ?? 0), 0);
+  const mutantsExecuted = mutationFiles.reduce((n, f) => n + (f.total ?? 0), 0);
+  const incompleteFiles = mutationFiles.filter((f) => f.parseError || (f.errored ?? 0) > 0 || (f.skipped ?? 0) > 0).length;
+  const complete = scorePercent !== null
+    && notAudited === 0
+    && incompleteFiles === 0
+    && maxMutations === Infinity
+    && mutantsExecuted === mutantsAvailable;
+  const scoreKind = scorePercent === null ? null : complete ? 'complete' : 'sampled';
+  const sampling = {
+    mode: selection,
+    filesAudited: mutationFiles.length,
+    filesCovered: mutationFiles.length + notAudited + skippedEmpty,
+    filesNotAudited: notAudited,
+    filesWithoutMutants: skippedEmpty,
+    filesIncomplete: incompleteFiles,
+    mutantsExecuted,
+    mutantsAvailable,
+    maxMutations: Number.isFinite(maxMutations) ? maxMutations : null,
+    complete,
+  };
+
   // Exit codes: something certainly wrong (1) is the CI signal; failing to run at
   // all (2) outranks it because the audit's result is not trustworthy.
   if (suiteError) process.exitCode = 2;
@@ -598,11 +690,13 @@ async function cmdScan() {
         process.exitCode = 1;
       }
     } else if (scorePercent < failUnder) {
-      scoreGate = `mutation score ${scorePercent}% is below --fail-under=${failUnder}`;
+      scoreGate = `${scoreKind} mutation score ${scorePercent}% is below --fail-under=${failUnder}`
+        + (complete ? '' : ` (${sampling.filesAudited}/${sampling.filesCovered} files, ${sampling.filesIncomplete} incomplete, ${mutantsExecuted}/${mutantsAvailable} mutants)`);
       gateFailed = true;
       process.exitCode = 1;
     } else {
-      scoreGate = `mutation score ${scorePercent}% meets --fail-under=${failUnder}`;
+      scoreGate = `${scoreKind} mutation score ${scorePercent}% meets --fail-under=${failUnder}`
+        + (complete ? '' : ` (${sampling.filesAudited}/${sampling.filesCovered} files, ${sampling.filesIncomplete} incomplete, ${mutantsExecuted}/${mutantsAvailable} mutants); use --limit=all --mutations=all to verify the whole project`);
     }
   }
 
@@ -624,8 +718,11 @@ async function cmdScan() {
       suiteChecked: Boolean(base),
       summary,
       mutationScore: scorePercent,
+      scoreKind,
+      sampling,
       scoreGate,
       uncovered,
+      heuristicCovers: hints,
       sfcFiles: (project.sfcFiles ?? []).map((f) => relPosix(project.root, f)),
       unsupported: project.unsupported ?? [],
       workspaces: (project.workspaces ?? []).map((dir) => relPosix(project.root, dir)),
@@ -640,7 +737,8 @@ async function cmdScan() {
         root: project.root,
       }),
       findings: enriched,
-      limit: maxFiles,
+      limit: selection === 'all' ? null : (Number.isFinite(maxFiles) ? maxFiles : null),
+      maxMutations: Number.isFinite(maxMutations) ? maxMutations : null,
       notAudited,
       files: mutationFiles.map((f) => ({
         file: f.relFile,
@@ -650,6 +748,8 @@ async function cmdScan() {
         errored: f.errored ?? 0,
         skipped: f.skipped ?? 0,
         skippedReason: f.skippedReason ?? null,
+        parseError: f.parseError ?? null,
+        language: f.language ?? null,
         confidence: f.grade.confidence,
         tests: f.testFiles,
         cached: f.cached ?? false,
@@ -727,11 +827,22 @@ async function cmdScan() {
     say('');
   }
 
-  const skippedFiles = mutationFiles.filter((f) => f.skipped > 0);
+  if (hints.length > 0) {
+    say(`${C.dim}${C.bold}Possible unverified coverage${C.reset} ${C.dim}(${hints.length})${C.reset}`);
+    for (const hint of hints.slice(0, 5)) {
+      say(`  ${C.dim}${hint.source} — name appears in ${hint.tests.map((test) => basename(test)).join(', ')}${C.reset}`);
+    }
+    say(`${C.dim}Not scored: add a real import/package reference, or audit the file directly.${C.reset}`);
+    say('');
+  }
+
+  const skippedFiles = mutationFiles.filter((f) => f.skipped > 0 || f.parseError);
   if (skippedFiles.length > 0) {
     say(`${C.yellow}${C.bold}Could not be audited${C.reset} ${C.dim}(${skippedFiles.length})${C.reset}`);
     for (const f of skippedFiles.slice(0, 6)) {
-      say(`  ${f.relFile} ${C.dim}— ${f.skippedReason ?? 'mutations could not be applied'}${C.reset}`);
+      say(`  ${f.relFile} ${C.dim}— ${f.parseError
+        ? `could not parse: ${f.parseError}`
+        : (f.skippedReason ?? 'mutations could not be applied')}${C.reset}`);
     }
     if (skippedFiles.length > 6) say(`  ${C.dim}... ${skippedFiles.length - 6} more${C.reset}`);
     say('');
@@ -751,9 +862,15 @@ async function cmdScan() {
 
   // A partial audit must say it is partial. Silence here made a `--limit=12` run
   // over a 40-file project read as "everything is fine".
+  if (skippedEmpty > 0) {
+    say(`${C.dim}${skippedEmpty} covered file${skippedEmpty === 1 ? '' : 's'} had no mutation candidates and did not consume --limit.${C.reset}`);
+    say('');
+  }
+
   if (notAudited > 0) {
-    say(`${C.yellow}${notAudited} covered file${notAudited === 1 ? ' was' : 's were'} not audited (over --limit=${maxFiles}).${C.reset}`);
-    say(`${C.dim}Re-run with --limit=${notAudited + maxFiles} or higher, or scan files individually.${C.reset}`);
+    say(`${C.yellow}${notAudited} covered file${notAudited === 1 ? ' was' : 's were'} not audited`
+      + ` (${selection === 'all' ? 'selection limit' : `selection=${selection}, --limit=${Number.isFinite(maxFiles) ? maxFiles : 'all'}`}).${C.reset}`);
+    say(`${C.dim}Re-run with --select=all --limit=all --mutations=all for a complete audit.${C.reset}`);
     say('');
   }
 
@@ -767,9 +884,13 @@ async function cmdScan() {
 
   if (scorePercent !== null) {
     const cachedCount = mutationFiles.filter((f) => f.cached).length;
-    say(`${C.dim}mutation score ${scorePercent}% across ${scoredFiles.length} file${scoredFiles.length === 1 ? '' : 's'}`
+    say(`${C.dim}${scoreKind} mutation score ${scorePercent}% across ${scoredFiles.length} file${scoredFiles.length === 1 ? '' : 's'}`
       + ` (${killedTotal} killed, ${survivedTotal} survived)`
+      + ` · ${mutantsExecuted}/${mutantsAvailable} mutants`
       + (cachedCount > 0 ? ` · ${cachedCount} from cache` : '') + `${C.reset}`);
+    if (!complete) {
+      say(`${C.dim}This is a sample. For a complete gate run: --select=all --limit=all --mutations=all.${C.reset}`);
+    }
   }
   if (scoreGate) {
     say(`${gateFailed ? C.red : C.dim}${scoreGate}${C.reset}`);
@@ -824,6 +945,23 @@ async function cmdFix() {
     .filter(([, tests]) => tests.length > 0)
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   const written = [];
+  const skippedRepairs = [];
+  const skip = (sourceFile, reason) => skippedRepairs.push({
+    source: relPosix(project.root, sourceFile), reason,
+  });
+
+  const fixTargets = [];
+  for (const [sourceFile, testFiles] of covered) {
+    if (fixTargets.length >= maxFiles) break;
+    let text;
+    try { text = await readFile(sourceFile, 'utf8'); } catch { continue; }
+    const detail = mutationsDetailed(text, sourceFile, { profile });
+    if (detail.mutations.length === 0 && !detail.parseError) {
+      skip(sourceFile, 'no mutation candidates exist in this file, so there is nothing a generated test could pin');
+      continue;
+    }
+    fixTargets.push([sourceFile, testFiles]);
+  }
 
   // Every file `fix` might touch, snapshotted before the first write. If the suite
   // goes red we restore these instead of leaving generated files behind for the
@@ -838,7 +976,7 @@ async function cmdFix() {
     }
   };
 
-  for (const [sourceFile, testFiles] of covered.slice(0, maxFiles)) {
+  for (const [sourceFile, testFiles] of fixTargets) {
     const rel = relPosix(project.root, sourceFile);
     const planned = placement({ sourceFile, testFiles, root: project.root });
     await rememberTarget(planned.fixPath);
@@ -854,26 +992,36 @@ async function cmdFix() {
     });
 
     if (boundary.written) {
-      written.push({ fixPath: boundary.written, kind: 'boundary' });
+      written.push({
+        fixPath: boundary.written,
+        kind: 'boundary',
+        sourceFile,
+        targets: boundary.targets ?? [],
+        unresolved: boundary.unresolved ?? [],
+      });
       say(`  ${C.green}wrote${C.reset} ${relPosix(project.root, boundary.written)}`
         + ` ${C.dim}(${boundary.cases} boundary comparison${boundary.cases === 1 ? '' : 's'} pinned)${C.reset}`);
-      continue;
+      for (const edge of boundary.unresolved ?? []) {
+        say(`  ${C.yellow}manual${C.reset} ${rel}:${edge.line} ${C.dim}${edge.expression} — ${edge.reason}${C.reset}`);
+      }
     }
 
+    let objectFixed = 0;
     if (boundary.manual?.length) {
-      say(`  ${C.cyan}manual${C.reset} ${rel} ${C.dim}(${boundary.reason})${C.reset}`);
+      say(`  ${C.cyan}manual${C.reset} ${rel} ${C.dim}(${boundary.reason ?? 'object arguments need a hand-written case'})${C.reset}`);
 
       // Try the object-argument path for each manual case: some of them are
       // fixable by reusing the argument shape the project's tests already build.
       const sourceText = await readFile(sourceFile, 'utf8');
-      const mapped = mapComparisonsToFunctions(sourceText);
-      let objectFixed = 0;
+      const manualFns = new Set(boundary.manual.map((item) => item.fn));
+      const mapped = mapComparisonsToFunctions(sourceText)
+        .filter((item) => manualFns.has(item.fn));
 
       for (const { fn, comparison } of mapped) {
         // Each function writes its own file (placement's `variant`), so snapshot
         // that exact path for the rollback as well as the shared one above.
         await rememberTarget(placement({
-          sourceFile, testFiles, root: project.root, variant: fn,
+          sourceFile, testFiles, root: project.root, variant: objectFileVariant(fn, comparison),
         }).fixPath);
         const result = await fixObjectBoundary({
           root: project.root,
@@ -888,32 +1036,48 @@ async function cmdFix() {
 
         if (result.written) {
           objectFixed += 1;
-          written.push({ fixPath: result.written, kind: 'object-boundary' });
+          written.push({
+            fixPath: result.written, kind: 'object-boundary', sourceFile, targets: result.targets ?? [],
+          });
           say(`  ${C.green}wrote${C.reset} ${relPosix(project.root, result.written)}`
             + ` ${C.dim}(${fn}: ${comparison.left} ${comparison.op} ${comparison.right})${C.reset}`);
         }
       }
-
-      if (objectFixed > 0) continue;
     }
+
+    // A boundary fix already owns the shared generated path, so falling through
+    // to value pinning would overwrite it. Object variants use distinct paths.
+    if (boundary.written || objectFixed > 0) continue;
+    if (boundary.reason) skip(sourceFile, boundary.reason);
 
     // 2. Otherwise pin exact values for the calls the tests already make.
     const source = await readFile(sourceFile, 'utf8');
     const names = exportedNames(source);
-    if (names.length === 0) continue;
+    if (names.length === 0) {
+      skip(sourceFile, sourceFile.endsWith('.py')
+        ? 'no module-level Python functions were found; class methods are not auto-fixed'
+        : 'no ESM exports were found; CommonJS modules can be audited but not auto-fixed');
+      continue;
+    }
 
     let testSource = '';
     for (const tf of testFiles) {
       try { testSource += await readFile(tf, 'utf8'); } catch { /* ignore */ }
     }
-    if (hasValuePinningAssertions(testSource)) continue;
+    if (hasValuePinningAssertions(testSource)) {
+      skip(sourceFile, 'the existing tests already pin concrete values, so no value-pinning file was generated');
+      continue;
+    }
 
     const sites = [];
     for (const tf of testFiles) {
       const text = await readFile(tf, 'utf8');
       sites.push(...harvestCallSites(text, names));
     }
-    if (sites.length === 0) continue;
+    if (sites.length === 0) {
+      skip(sourceFile, 'no reusable call sites were found in the covering tests');
+      continue;
+    }
 
     const { fixPath, importPath, dir, probeName } = planned;
 
@@ -936,6 +1100,7 @@ async function cmdFix() {
       }
 
       if (!probed || probed.length === 0) {
+        skip(sourceFile, 'the probe could not read runtime values for the covered calls');
         say(`  ${C.yellow}skip${C.reset} ${rel} ${C.dim}(could not read values with a probe)${C.reset}`);
         continue;
       }
@@ -947,18 +1112,21 @@ async function cmdFix() {
         runner: probeStyle,
       });
 
-      if (!/\b(expect|assert)\.?\w*\(/.test(body)) {
-        say(`  ${C.yellow}skip${C.reset} ${rel} ${C.dim}(no pinnable values)${C.reset}`);
+      const contract = validateGeneratedTest(body, fixPath);
+      if (!contract.valid) {
+        skip(sourceFile, contract.reason);
+        say(`  ${C.yellow}skip${C.reset} ${rel} ${C.dim}(${contract.reason})${C.reset}`);
         continue;
       }
 
       const gate = await mayWrite(fixPath, { force });
       if (!gate.write) {
+        skip(sourceFile, gate.reason);
         say(`  ${C.yellow}skip${C.reset} ${relPosix(project.root, fixPath)} ${C.dim}(${gate.reason})${C.reset}`);
         continue;
       }
       await writeFile(fixPath, stamp(body, 'js'), 'utf8');
-      written.push({ fixPath, kind: 'values' });
+      written.push({ fixPath, kind: 'values', sourceFile, targets: [] });
       say(`  ${C.green}wrote${C.reset} ${relPosix(project.root, fixPath)}`
         + ` ${C.dim}(${probed.length} calls pinned)${C.reset}`);
     } finally {
@@ -968,8 +1136,18 @@ async function cmdFix() {
   }
 
   if (written.length === 0) {
-    say(`  ${C.dim}nothing to fix${C.reset}`);
-    emitFixJson({ written: [], rolledBack: false, suiteGreen: true });
+    const unique = [...new Map(skippedRepairs.map((item) => [item.reason, item])).values()];
+    if (unique.length === 0) {
+      say(`  ${C.dim}no automatically fixable findings were found in the audited files${C.reset}`);
+    } else {
+      say(`  ${C.yellow}no automatic repair was written${C.reset}`);
+      for (const item of unique.slice(0, 8)) {
+        const sources = skippedRepairs.filter((entry) => entry.reason === item.reason).length;
+        say(`  ${C.dim}${item.reason} (${sources} file${sources === 1 ? '' : 's'})${C.reset}`);
+      }
+      say(`  ${C.dim}This is a stated limitation, not evidence that the tests are healthy.${C.reset}`);
+    }
+    emitFixJson({ written: [], skipped: skippedRepairs, rolledBack: false, suiteGreen: true });
     return;
   }
 
@@ -977,8 +1155,33 @@ async function cmdFix() {
   say('');
   if (after.green) {
     say(`${C.green}${C.bold}${written.length} file(s) written, suite still green.${C.reset}`);
-    say(`Run ${C.cyan}crucible verify ${target}${C.reset} to see the new mutation score.`);
-    emitFixJson({ written, rolledBack: false, suiteGreen: true });
+    say(`${C.dim}suite-green is not proof of repair; re-running every target mutation now.${C.reset}`);
+    const repairs = await verifyRepairs({
+      root: project.root,
+      written,
+      command: project.runner.command,
+    });
+    const repaired = repairs.filter((item) => item.status === 'repaired').length;
+    const verified = repairs.reduce((n, item) => n + item.verified, 0);
+    const total = repairs.reduce((n, item) => n + item.total, 0);
+    for (const item of repairs) {
+      const label = item.status === 'repaired'
+        ? `${C.green}repaired${C.reset}`
+        : item.status === 'partial'
+          ? `${C.yellow}partial${C.reset}`
+          : `${C.yellow}unverified${C.reset}`;
+      say(`  ${label} ${relPosix(project.root, item.fixPath)}`
+        + (item.total > 0 ? ` ${C.dim}(${item.verified}/${item.total} target mutations killed)${C.reset}` : '')
+        + (item.reason ? ` ${C.dim}— ${item.reason}${C.reset}` : ''));
+    }
+    say(`${C.bold}${repaired}/${repairs.length} repairs verified${C.reset}`
+      + `, ${verified}/${total} target mutations killed.`);
+    if (repairs.some((item) => item.status === 'partial' || item.status === 'ineffective')) {
+      process.exitCode = 1;
+      say(`${C.red}At least one written test did not kill its target mutation.${C.reset}`);
+    }
+    say(`Run ${C.cyan}crucible verify ${target}${C.reset} to see the complete score.`);
+    emitFixJson({ written, repairs, rolledBack: false, suiteGreen: true });
   } else {
     // Never leave the tree red. Restore every target to its pre-run state: files
     // that existed get their content back, files we created are removed.
@@ -1010,13 +1213,29 @@ function emitFixJson(result) {
     written: (result.written ?? []).map((w) => ({
       file: w.fixPath,
       kind: w.kind,
+      source: w.sourceFile ?? null,
+      targets: w.targets ?? [],
+      unresolved: w.unresolved ?? [],
     })),
+    repairs: (result.repairs ?? []).map((item) => ({
+      file: item.fixPath,
+      source: item.sourceFile,
+      status: item.status,
+      verified: item.verified,
+      total: item.total,
+      reason: item.reason ?? null,
+      unresolved: item.unresolved ?? [],
+    })),
+    repaired: (result.repairs ?? []).filter((item) => item.status === 'repaired').length,
+    skipped: result.skipped ?? [],
     rolledBack: Boolean(result.rolledBack),
     rolledBackCount: result.rolledBackCount ?? null,
     suiteGreen: Boolean(result.suiteGreen),
     next: result.rolledBack
       ? { kind: 'review', instruction: 'The generated tests failed the suite and were rolled back. Inspect the pinned values by hand.' }
-      : { kind: 'run_command', command: `npx @hsaohuang/crucible scan ${JSON.stringify(target)} --json`, instruction: 'Re-run scan to confirm the score moved.' },
+      : (result.written ?? []).length === 0
+        ? { kind: 'review', instruction: 'No automatic repair was written. Read skipped[] for the reason; the findings still require a hand-written test or a deliberate decision to accept the gap.' }
+        : { kind: 'run_command', command: `npx @hsaohuang/crucible scan ${JSON.stringify(target)} --json`, instruction: 'Re-run scan to confirm the score moved.' },
   }, null, 2));
 }
 
@@ -1100,7 +1319,7 @@ const commands = { check: cmdCheck, scan: cmdScan, fix: cmdFix, verify: cmdVerif
 const USAGE = `usage:
   crucible check  [path]  fast: read the tests, report those that cannot fail
   crucible scan   [path]  slow: mutate the source, find untested boundaries
-  crucible fix    [path]  write the boundary tests that were missing
+  crucible fix    [path]  attempt missing boundary tests, then replay target mutations
   crucible verify [path]  re-run the audit after a fix
   crucible install        copy the agent skill into OpenCode and Claude Code
 
@@ -1109,7 +1328,9 @@ const USAGE = `usage:
 
 options:
   --json            machine-readable output, with a next step per finding
-  --limit=N         scan: audit at most N source files (default 12)
+  --limit=N|all     scan: audit at most N source files (default 12); all = no cap
+  --mutations=N|all scan: sample at most N mutants per file (default 12); all = full
+  --select=MODE     scan: file order: files (default), changed, risk, all
   --jobs=N          scan: parallel sandbox workers (default min(4, cpus); 1 = in place)
   --no-cache        scan: ignore the incremental results cache
   --fail-under=N    scan: exit 1 when the mutation score is below N percent
@@ -1126,6 +1347,8 @@ examples:
   crucible check                 # is anything obviously broken?
   crucible check src/cart.js     # just the tests that cover one file
   crucible scan --limit=3        # deeper look at three files
+  crucible scan --select=changed # start with recently edited source files
+  crucible scan --limit=all --mutations=all  # complete mutation audit
   crucible scan --fail-under=80  # CI gate on the mutation score
   crucible fix && crucible verify
   crucible install               # let the agent notice crucible on its own
@@ -1143,7 +1366,7 @@ const BOOLEAN_FLAGS = new Set([
   '--json', '--verbose', '--no-mutation', '--force', '--allow-env-noise',
   '--no-cache', '--version', '-v', '--help', '-h',
 ]);
-const VALUE_FLAG_PREFIXES = ['--limit=', '--profile=', '--dir=', '--jobs=', '--fail-under='];
+const VALUE_FLAG_PREFIXES = ['--limit=', '--mutations=', '--select=', '--profile=', '--dir=', '--jobs=', '--fail-under='];
 for (const arg of argv) {
   if (!arg.startsWith('-')) continue;
   if (BOOLEAN_FLAGS.has(arg)) continue;

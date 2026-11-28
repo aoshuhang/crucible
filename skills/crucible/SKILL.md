@@ -37,19 +37,43 @@ when that is the whole change (`crucible scan src/cart.js`).
 `scan` runs the project's tests once per mutation. On a real project that is
 **seconds to minutes**, not instant. Tell the user you are running it before you
 start, and use `--limit=N` (default 12) to keep it bounded. Results are cached by
-file content, so a second run over unchanged files is fast; `--jobs=N` runs
-mutations in parallel sandbox copies.
+file content and dependency environment, so a second run over unchanged files is
+fast; `--jobs=N` runs mutations in parallel sandbox copies.
+
+A default score is a **sample**. Before quoting it as project quality, read
+`scoreKind` and `sampling`. For a complete gate use:
+
+```bash
+npx @hsaohuang/crucible scan <path> --limit=all --mutations=all --select=all --json
+```
 
 `scan` exits 1 when something certainly cannot fail and 2 when it could not run at
-all (no runner, red suite). `--fail-under=N` adds a mutation-score gate for CI.
+all (no runner, red suite). `--fail-under=N` adds a mutation-score gate for CI;
+when the score is sampled, the gate text states how much was audited.
 
 Read the JSON, not the human output, when you need to act on it:
 
 ```json
 {
   "summary": { "fakeTests": 2, "likelyFake": 4, "worthChecking": 3 },
+  "mutationScore": 58,
+  "scoreKind": "sampled",
+  "sampling": {
+    "mode": "files",
+    "filesAudited": 12,
+    "filesCovered": 15,
+    "filesNotAudited": 3,
+    "filesWithoutMutants": 1,
+    "filesIncomplete": 0,
+    "mutantsExecuted": 144,
+    "mutantsAvailable": 611,
+    "complete": false
+  },
   "limit": 12,
   "notAudited": 3,
+  "heuristicCovers": [
+    { "source": "src/legacy.js", "tests": ["test/smoke.test.js"] }
+  ],
   "findings": [
     {
       "id": "no-assertion",
@@ -76,8 +100,16 @@ Read the JSON, not the human output, when you need to act on it:
 ```
 
 `notAudited` is the number of covered files `--limit` left out; if it is non-zero,
-the report is partial. `files[].survivors` names every surviving mutation, so you
-can write the missing test without re-running anything.
+the report is partial. `sampling.complete` is the authoritative flag. A
+`heuristicCovers` entry is only a basename clue and is deliberately excluded from
+scores. `files[].survivors` names every surviving mutation, so you can write the
+missing test without re-running anything. `files[].parseError` means the file
+could not be parsed and was not audited.
+
+`fix --json` reports each written file under `written` and a replay result under
+`repairs`. Only `status: "repaired"` means the generated test killed every target
+mutation. `unverified` and `partial` are not evidence of a repair, even when the
+suite is green.
 
 ## How to read the confidence grades
 
@@ -87,10 +119,11 @@ This is the part that decides what you are allowed to claim.
 |---|---|---|
 | `certain` | provable by reading one line | fix it, no debate |
 | `likely` | a deliberate break went unnoticed | fix it, it is almost certainly a gap |
-| `suspect` | tests do pin values; may be intentional | mention it, do not call it a fake test |
+| `suspect` | tests pin values, are explicit smoke/skip tests, or may be intentional | mention it, do not call it a fake test |
 
 Never tell the user their tests are fake based on a `suspect` finding. A property
-test on a noise function legitimately survives a constant tweak.
+test on a noise function legitimately survives a constant tweak, and an integration
+test skipped because Kafka is unavailable is a deliberate gate.
 
 ## What `fix` cannot do
 
@@ -101,12 +134,16 @@ That is the exact defect the tool exists to find, so it declines and prints the
 comparison for a human instead.
 
 When the output says `manual`, write that test yourself. It tells you the
-expression and the case you need.
+expression and the case you need. When `fix --json` writes nothing, read
+`skipped[]`: CommonJS exports, unobservable intermediate comparisons and probes
+that cannot read values are stated limitations, not proof that the suite is fine.
 
 ## Do not do this
 
-- Do not run `fix` and then claim the tests are now real without re-running `scan`
-  to see the score move.
+- Do not run `fix` and then claim the tests are now real without checking
+  `repairs[].status` and re-running `scan` to see the score move.
+- Do not quote a `sampled` score as the whole project's quality, and do not claim
+  a `--fail-under` pass proves the project when files or mutants were left out.
 - Do not treat a low score as a verdict on the developer. A 52% score on a game
   prototype with a state machine is normal; the useful part is the list of specific
   untested edges.
