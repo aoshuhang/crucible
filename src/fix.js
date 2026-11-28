@@ -385,8 +385,10 @@ export function placement({ sourceFile, testFiles, root, variant = null }) {
   const isPython = ext === '.py';
 
   if (isPython) {
-    // pytest convention: tests live in test_<module>.py.
-    const near = testFiles.find((t) => /\/(tests?|__tests__)\//.test(t));
+    // pytest convention: tests live in test_<module>.py. Compare the
+    // root-relative path with POSIX separators; an absolute Windows path never
+    // contains `/tests/`.
+    const near = testFiles.find((t) => /(^|\/)(tests?|__tests__)\//.test(relative(root, t).replace(/\\/g, '/')));
     const dir = near ? dirname(near) : dirname(sourceFile);
     const base = basename(sourceFile).replace(/\.py$/, '');
     const fixPath = join(dir, `test_${base}_exact.py`);
@@ -412,7 +414,7 @@ export function placement({ sourceFile, testFiles, root, variant = null }) {
   const probeExt = isTs ? '.test.ts' : '.test.js';
 
   // Prefer the directory the project already keeps its tests in.
-  const near = testFiles.find((t) => /\/(tests?|__tests__)\//.test(t));
+  const near = testFiles.find((t) => /(^|\/)(tests?|__tests__)\//.test(relative(root, t).replace(/\\/g, '/')));
   const dir = near ? dirname(near) : dirname(sourceFile);
   const base = basename(sourceFile).replace(/\.[^.]+$/, '');
   const name = variant ? `${base}.${variant}` : base;
