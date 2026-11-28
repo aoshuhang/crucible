@@ -43,6 +43,9 @@ jobs:
         run: npm run selftest
 
       - name: a complete audit labels its score complete
+        # Git Bash is present on every hosted runner; PowerShell does not support
+        # the POSIX line continuation or `|| true` used below.
+        shell: bash
         run: |
           node bin/crucible.js scan test/fixtures/project --json --no-cache --jobs=1 \
             --limit=all --mutations=all --select=all > complete.json || true
