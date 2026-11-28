@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { discover, workspaceDirs, normaliseJsSpec } from '../src/discover.js';
 
@@ -62,7 +62,7 @@ test('single-file components are collected for script reading, not counted as un
   // .vue/.svelte carry a <script> block: check can read it, so the file is a
   // known quantity rather than "unsupported".
   assert.deepEqual(
-    projectInfo.sfcFiles.sort().map((f) => f.split('/').pop()),
+    projectInfo.sfcFiles.sort().map((file) => basename(file)),
     ['App.vue', 'Panel.svelte'],
   );
   const byExt = Object.fromEntries(projectInfo.unsupported.map((item) => [item.ext, item.count]));
@@ -278,7 +278,7 @@ test('test support, examples and tooling are not counted as product source', asy
   await writeFile(join(dir, 'playwright.config.js'), 'export default {};\n', 'utf8');
 
   const projectInfo = await discover(dir);
-  const names = projectInfo.sourceFiles.map((file) => file.split('/').pop());
+  const names = projectInfo.sourceFiles.map((file) => basename(file));
   assert.ok(names.includes('a.js'), 'real src/ source stays');
   assert.ok(!names.includes('conftest.py'));
   assert.ok(!names.includes('support.py'));

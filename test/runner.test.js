@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { discover } from '../src/discover.js';
 
@@ -69,7 +69,7 @@ test('index.js is treated as source, not skipped as an entry point', async (t) =
   t.after(() => rm(dir, { recursive: true, force: true }));
 
   const project = await discover(dir);
-  const names = project.sourceFiles.map((f) => f.split('/').pop());
+  const names = project.sourceFiles.map((file) => basename(file));
   assert.ok(names.includes('index.js'),
     `index.js is the library in most packages, got: ${names.join(', ')}`);
 });
@@ -80,6 +80,6 @@ test('type declaration files are not treated as source', async (t) => {
   await writeFile(join(dir, 'src/index.d.ts'), 'export declare const a: number;\n');
 
   const project = await discover(dir);
-  const names = project.sourceFiles.map((f) => f.split('/').pop());
+  const names = project.sourceFiles.map((file) => basename(file));
   assert.ok(!names.includes('index.d.ts'), 'declaration files have no runtime behaviour');
 });

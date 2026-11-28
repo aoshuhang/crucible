@@ -114,6 +114,16 @@ test('looksLikeSyntaxError recognises runner parse failures', () => {
     'AssertionError: expected err.name to be \'SyntaxError\'',
     '1) math works:\n     Error: the parser did not throw a SyntaxError',
     'Error: could not parse the intent',
+    // Node 20 TAP prints a generic `error:` field on every assertion failure.
+    [
+      'not ok 2 - exactly at the threshold',
+      "  location: '/repo/tests/limits.exact.test.js:13:3'",
+      '  failureType: testCodeFailure',
+      '  error: |-',
+      '    Expected values to be strictly equal:',
+      '    false !== true',
+      "  code: 'ERR_ASSERTION'",
+    ].join('\n'),
   ];
   for (const notAnError of notErrors) {
     assert.equal(looksLikeSyntaxError(notAnError), false, `should NOT classify: ${notAnError.slice(0, 60)}`);
@@ -307,14 +317,17 @@ test('fix --json prints a machine-readable report', async (t) => {
 // ---------------------------------------------------------------------------
 
 test('shQuote is safe for hostile file names', () => {
-  assert.equal(shQuote('plain.js'), 'plain.js');
+  assert.equal(shQuote('plain.js', 'linux'), 'plain.js');
   // A single quote in the value is spliced as '\'' — the standard POSIX idiom.
-  assert.equal(shQuote("it's.js"), String.raw`'it'\''s.js'`);
+  assert.equal(shQuote("it's.js", 'linux'), String.raw`'it'\''s.js'`);
   // A command substitution in the name must not survive as live shell: it is
   // wrapped in single quotes, where the shell expands nothing.
-  const quoted = shQuote('$(touch pwned).test.js');
+  const quoted = shQuote('$(touch pwned).test.js', 'linux');
   assert.equal(quoted, String.raw`'$(touch pwned).test.js'`);
   assert.ok(quoted.startsWith("'"), 'hostile names are always single-quoted');
+
+  assert.equal(shQuote('C:\\Program Files\\x.js', 'win32'), '"C:\\Program Files\\x.js"');
+  assert.equal(shQuote('plain.js', 'win32'), 'plain.js');
 });
 
 // ---------------------------------------------------------------------------

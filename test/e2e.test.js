@@ -2,12 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { cp, rm, readFile, writeFile, mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { discover } from '../src/discover.js';
 import { baseline, auditFile } from '../src/judge.js';
 import { fixBoundaries } from '../src/fix-boundary.js';
 
-const FIXTURE = new URL('./fixtures/project/', import.meta.url).pathname;
+const FIXTURE = fileURLToPath(new URL('./fixtures/project/', import.meta.url));
 
 /**
  * The end-to-end claim this product makes: a fake test scores low, and after the

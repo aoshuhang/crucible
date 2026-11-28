@@ -2,12 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { cp, rm, mkdtemp, readFile, rm as rmFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { discover } from '../src/discover.js';
 import { baseline, auditFile } from '../src/judge.js';
 import { fixObjectBoundary } from '../src/fix-object.js';
 
-const FIXTURE = new URL('./fixtures/object-args/', import.meta.url).pathname;
+const FIXTURE = fileURLToPath(new URL('./fixtures/object-args/', import.meta.url));
 
 /**
  * The claim this covers: a comparison on an object field can be fixed by reusing

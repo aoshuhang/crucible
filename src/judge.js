@@ -12,7 +12,8 @@
 
 import { exec } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
-import { rmSync, writeFileSync } from 'node:fs';
+import { readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, isAbsolute, relative } from 'node:path';
 import { mutationsDetailed, applyMutation } from './mutate.js';
 import { relPosix, baseName, shQuote } from './paths.js';
 
@@ -109,8 +110,40 @@ export function cleanupSandboxesSync() {
   return removed;
 }
 
+/**
+ * Expand simple `*`/`?` file globs before handing a command to cmd.exe.
+ * Windows shells do not expand globs, so the project's own
+ * `node --test tests/*.test.js` would pass a literal pattern and run nothing.
+ * POSIX shells already expand these; Windows needs the explicit file list.
+ */
+export function expandWindowsGlobs(command, cwd) {
+  const tokens = command.match(/(?:'[^']*'|"[^"]*"|\S+)/g) ?? [];
+  return tokens.map((token) => {
+    if (token.startsWith('-') || token.includes('=')) return token;
+    const quoted = token.length > 1 && /^['"]/.test(token) && /['"]$/.test(token);
+    const raw = quoted ? token.slice(1, -1) : token;
+    if (!/[*?]/.test(raw)) return token;
+
+    const target = isAbsolute(raw) ? raw : join(cwd, raw);
+    if (raw.includes('**')) return token; // uncommon; leave shell exactly as-is
+    const dir = dirname(target);
+    const mask = target.slice(dir.length + 1);
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return token; }
+    const re = new RegExp(`^${mask.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
+    const matches = entries
+      .filter((entry) => entry.isFile() && re.test(entry.name))
+      .map((entry) => (isAbsolute(raw) ? join(dir, entry.name) : relative(cwd, join(dir, entry.name))))
+      .sort();
+    return matches.length > 0 ? matches.map((match) => shQuote(match)).join(' ') : token;
+  }).join(' ');
+}
+
 /** Run a shell command in a directory, capturing output. Never throws. */
 export function run(command, cwd, timeoutMs = 120_000) {
+  const effectiveCommand = process.platform === 'win32'
+    ? expandWindowsGlobs(command, cwd)
+    : command;
   return new Promise((resolvePromise) => {
     const started = Date.now();
 
@@ -121,7 +154,7 @@ export function run(command, cwd, timeoutMs = 120_000) {
     delete env.NODE_TEST_CONTEXT;
     delete env.NODE_V8_COVERAGE;
 
-    exec(command, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, env },
+    exec(effectiveCommand, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, env },
       (error, stdout, stderr) => {
         resolvePromise({
           ok: !error,
@@ -511,15 +544,19 @@ export function restoreFailuresSeen() {
 export function looksLikeSyntaxError(output) {
   const text = String(output);
   // Anchor A: start of a line, optionally indented and/or behind pytest's `E   `
-  // failure marker. Anchor B: right after a file location the way tsc
-  // (`src/a.ts:5:12 - error TS1005`), swiftc (`a.swift:3:13: error:`) and go
-  // (`a.go:3:5: syntax error:`) report. An assertion message that merely
-  // mentions an error name matches neither anchor, because runners always
-  // prefix it (`AssertionError:`, `Error:`, `- expected ...`).
-  const at = String.raw`(?:(?:^|\n)\s*(?:E[ \t]+)?|(?:^|\n)[^\n]*?:\d+:\d+[\s:-]*)`;
+  // failure marker. `[ \t]*`, never `\s*`: the latter spans newlines and matched
+  // Node 20's TAP `error: |-` field on an ordinary assertion failure.
+  // Anchor B: a file location and the compiler message on the SAME line, the way
+  // tsc (`src/a.ts:5:12 - error TS1005`), swiftc (`a.swift:3:13: error:`) and go
+  // (`a.go:3:5: syntax error:`) report.
+  const lineStart = String.raw`(?:^|\n)[ \t]*(?:E[ \t]+)?`;
+  const location = String.raw`(?:^|\n)[^\n]*?:\d+:\d+[ \t:-]*`;
+  const at = String.raw`(?:${lineStart}|${location})`;
   if (new RegExp(String.raw`${at}SyntaxError:`).test(text)) return true; // node, jest, pytest
   if (new RegExp(String.raw`${at}error TS1\d{3}`).test(text)) return true; // tsc
-  if (new RegExp(String.raw`${at}error:`).test(text)) return true; // rustc/swiftc, lowercase only: JS failures print `Error:`
+  // Lowercase compiler `error:`: rustc puts it at column 0; swiftc follows a
+  // location. TAP indents its `error:` field, which is a test failure, not parse.
+  if (new RegExp(String.raw`(?:(?:^|\n)error:|${location}error:)`).test(text)) return true;
   if (new RegExp(String.raw`${at}(?:Unexpected token|Unexpected end of input|Unexpected identifier|Unexpected character|missing \) after argument list)`).test(text)) return true; // V8, babel
   if (/(?:^|\n)[^\n]{0,4}\[ERROR\]/.test(text)) return true; // esbuild: `✘ [ERROR] Expected ";" but found "x"`
   if (new RegExp(`${at}(?:Failed to parse|ParseError:|expected expression|expected one of|syntax error)`, 'i').test(text)) return true; // pytest prelude, esbuild ParseError, go
@@ -553,6 +590,7 @@ export async function baseline({ root, command, timeoutMs = 180_000 }) {
   const missing = dependencyFetchFailure
     || result.code === 127
     || /command not found|No module named|not found in \$PATH|cannot find package/i.test(output)
+    || /is not recognized as an internal or external command|The system cannot find the path specified/i.test(output)
     // `npx --no-install` refuses when the binary is not in node_modules, which is
     // what a fresh clone looks like before `npm install`.
     || /npx canceled due to missing packages|could not determine executable|ENOENT.*spawn/i.test(output);

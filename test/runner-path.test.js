@@ -4,6 +4,7 @@ import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { discover } from '../src/discover.js';
+import { expandWindowsGlobs } from '../src/judge.js';
 
 /**
  * Two bugs found by running against real repositories, both of which made the tool
@@ -80,4 +81,23 @@ test('vitest declared as a dependency is still prefixed correctly', async (t) =>
   assert.ok(/vitest/.test(p.runner.command));
   assert.ok(!/^vitest/.test(p.runner.command),
     `a bare vitest would fail with 127, got: ${p.runner.command}`);
+});
+
+test('Windows command globs expand to actual test files', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'crucible-win-glob-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await mkdir(join(dir, 'tests'), { recursive: true });
+  await writeFile(join(dir, 'tests/a.test.js'), '', 'utf8');
+  await writeFile(join(dir, 'tests/b.test.js'), '', 'utf8');
+  await writeFile(join(dir, 'tests/not-a-test.txt'), '', 'utf8');
+
+  const expanded = expandWindowsGlobs('node --test tests/*.test.js', dir);
+  assert.match(expanded, /tests[\\/]a\.test\.js/);
+  assert.match(expanded, /tests[\\/]b\.test\.js/);
+  assert.doesNotMatch(expanded, /\*\.test\.js/);
+  assert.doesNotMatch(expanded, /not-a-test/);
+
+  const option = '--test-name-pattern=a*';
+  assert.equal(expandWindowsGlobs(`node --test ${option}`, dir), `node --test ${option}`,
+    'glob-looking option values must not be treated as paths');
 });
